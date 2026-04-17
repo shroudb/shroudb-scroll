@@ -31,8 +31,10 @@ Initial release. Everything listed below is P0 + P1 scope per `SPEC.md` §18.
 
 ### Known follow-ups (P2, cross-repo)
 - Chronicle `Engine::Scroll` variant bump in `shroudb-chronicle-core` — Scroll currently emits audit events as `Engine::Custom("scroll")`.
-- Moat embedding in `shroudb-moat` for unified deployment.
 - Open questions Q2 (retention vs. lagging groups), Q3 (CAS fairness), Q4 (DLQ replay), Q7 (reader-group idle GC) remain deferred.
+
+### Done (P2, cross-repo)
+- **Moat embedding** shipped in shroudb-moat commit `7ba5229`. Scroll runs behind the `moat`-side `scroll` feature flag with prefix-routed command dispatch, embedded Cipher DEK wrapping, and an end-to-end integration test proving the full TCP → router → engine → Cipher path.
 
 ### Coverage
 96 tests across 6 crates. `cargo fmt`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo deny check` all pass.
