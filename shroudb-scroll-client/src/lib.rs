@@ -74,8 +74,8 @@ impl ScrollClient {
         if let Some(h) = headers
             && !h.is_empty()
         {
-            headers_json = serde_json::to_string(h)
-                .map_err(|e| ClientError::Serialization(e.to_string()))?;
+            headers_json =
+                serde_json::to_string(h).map_err(|e| ClientError::Serialization(e.to_string()))?;
             cmd.push("HEADERS".into());
             cmd.push(headers_json);
         }

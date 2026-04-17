@@ -31,8 +31,29 @@ impl Connection {
 
 #[cfg(test)]
 mod tests {
-    // Connection requires a live server; exercised end-to-end via the server
-    // crate's integration tests.
-    #[test]
-    fn placeholder() {}
+    use super::*;
+
+    #[tokio::test]
+    async fn connect_to_closed_port_returns_error() {
+        // Port 1 is privileged and bound by nothing on a normal dev box; the
+        // kernel should send RST immediately. This exercises the full
+        // shroudb_client_common error → ClientError mapping.
+        let err = Connection::connect("127.0.0.1:1")
+            .await
+            .err()
+            .expect("expected error");
+        assert!(
+            matches!(err, ClientError::Connection(_) | ClientError::Protocol(_)),
+            "expected transport-level error, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_to_garbage_address_returns_error() {
+        let err = Connection::connect("not a socket address")
+            .await
+            .err()
+            .expect("expected error");
+        assert!(matches!(err, ClientError::Connection(_)));
+    }
 }

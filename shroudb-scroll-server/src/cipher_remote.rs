@@ -70,8 +70,29 @@ impl ScrollCipherOps for RemoteCipherOps {
 
 #[cfg(test)]
 mod tests {
-    // Requires a running Cipher server; exercised through full server
-    // integration tests in downstream deployments rather than unit tests.
-    #[test]
-    fn placeholder() {}
+    use super::*;
+
+    #[tokio::test]
+    async fn connect_to_closed_port_fails() {
+        // Port 1 is bound by nothing on a normal dev host; the connect should
+        // fail fast with an error that `?`-propagates via anyhow.
+        let err = RemoteCipherOps::connect("127.0.0.1:1", "scroll-test".into(), None)
+            .await
+            .err()
+            .expect("unreachable cipher should fail");
+        let msg = err.to_string().to_ascii_lowercase();
+        assert!(
+            msg.contains("connect") || msg.contains("refused") || msg.contains("connection"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_to_garbage_address_fails() {
+        let err = RemoteCipherOps::connect("not:a:valid:addr", "k".into(), None)
+            .await
+            .err()
+            .expect("garbage addr must not connect");
+        assert!(!err.to_string().is_empty());
+    }
 }
