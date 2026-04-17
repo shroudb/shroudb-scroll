@@ -1,0 +1,27 @@
+[package]
+name = "shroudb-scroll-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+shroudb-scroll-core = { workspace = true }
+shroudb-store = { workspace = true }
+shroudb-acl = { workspace = true }
+shroudb-crypto = { workspace = true }
+shroudb-chronicle-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+dashmap = { workspace = true }
+base64 = { workspace = true }
+
+[dev-dependencies]
+shroudb-storage = { workspace = true, features = ["testing"] }
+shroudb-crypto = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
+tempfile = "3"
+uuid = { workspace = true }

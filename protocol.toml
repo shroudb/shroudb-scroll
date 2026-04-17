@@ -1,0 +1,192 @@
+# Scroll Protocol Specification
+#
+# Machine-readable definition of the Scroll v0.1 protocol.
+# Used by shroudb-codegen to generate typed client libraries.
+
+[protocol]
+name = "scroll"
+version = "0.1.0"
+description = "Durable append-only event log with cursored readers and reader groups"
+default_tcp_port = 7200
+uri_schemes = ["scroll://", "scroll+tls://"]
+uri_format = "{scheme}[token@]host[:port]"
+
+[protocol.wire_format]
+type = "resp3"
+request_format = "array_of_bulk_strings"
+success_envelope = "json_bulk_string"
+error_envelope = "simple_error"
+
+# ─── Error codes ──────────────────────────────────────────────────
+
+[error_codes.DENIED]
+description = "Authentication, authorization, or ABAC policy denied the request"
+http_equiv = 401
+
+[error_codes.BADARG]
+description = "Invalid argument, malformed payload, or entry exceeds max_entry_bytes"
+http_equiv = 400
+
+[error_codes.NOTFOUND]
+description = "Log or reader group does not exist"
+http_equiv = 404
+
+[error_codes.CONFLICT]
+description = "Reader group already exists, or CAS retry budget exhausted"
+http_equiv = 409
+
+[error_codes.CAPABILITY]
+description = "Required engine capability is not configured (e.g. Cipher)"
+http_equiv = 503
+
+[error_codes.INTERNAL]
+description = "Internal server error"
+http_equiv = 500
+
+# ─── Data-plane commands ──────────────────────────────────────────
+
+[commands.APPEND]
+syntax = "APPEND <log> <payload_b64> [HEADERS <json>] [TTL <ms>]"
+description = "Append an entry to a log. Mints a monotonic offset via CAS and encrypts the entry with the per-log DEK."
+acl = { namespace = "scroll.<log>", scope = "write" }
+parameters = [
+    { name = "log", type = "string", required = true, description = "Tenant-scoped log name" },
+    { name = "payload_b64", type = "base64", required = true, description = "Entry body (binary-safe, base64-encoded on wire)" },
+    { name = "headers", type = "json", required = false, description = "String→string map, size-capped by max_header_bytes" },
+    { name = "ttl_ms", type = "integer", required = false, description = "Per-entry TTL in milliseconds" },
+]
+response = { status = "string", offset = "integer" }
+
+[commands.READ]
+syntax = "READ <log> <from_offset> <limit>"
+description = "Range read starting at from_offset. Missing offsets (trimmed / TTL-expired) are skipped silently."
+acl = { namespace = "scroll.<log>", scope = "read" }
+parameters = [
+    { name = "log", type = "string", required = true },
+    { name = "from_offset", type = "integer", required = true, description = "First offset to include" },
+    { name = "limit", type = "integer", required = true, description = "Maximum entries to return" },
+]
+response = { status = "string", entries = "array<LogEntry>" }
+
+[commands.CREATE_GROUP]
+syntax = "CREATE_GROUP <log> <group> <start_offset>"
+description = "Create a reader group. start_offset = 'earliest' | '0' starts from offset 0; 'latest' | '-1' starts after the current tail."
+acl = { namespace = "scroll.<log>", scope = "write" }
+parameters = [
+    { name = "log", type = "string", required = true },
+    { name = "group", type = "string", required = true },
+    { name = "start_offset", type = "string", required = true, description = "'earliest', 'latest', or a u64 literal" },
+]
+response = { status = "string" }
+
+[commands.READ_GROUP]
+syntax = "READ_GROUP <log> <group> <reader_id> <limit>"
+description = "Advance the group cursor under CAS, register PendingEntry records, and return the decrypted batch."
+acl = { namespace = "scroll.<log>", scope = "read" }
+parameters = [
+    { name = "log", type = "string", required = true },
+    { name = "group", type = "string", required = true },
+    { name = "reader_id", type = "string", required = true, description = "Stable identifier for the calling reader member" },
+    { name = "limit", type = "integer", required = true },
+]
+response = { status = "string", entries = "array<LogEntry>" }
+
+[commands.ACK]
+syntax = "ACK <log> <group> <offset>"
+description = "Acknowledge a pending entry. Idempotent."
+acl = { namespace = "scroll.<log>", scope = "read" }
+parameters = [
+    { name = "log", type = "string", required = true },
+    { name = "group", type = "string", required = true },
+    { name = "offset", type = "integer", required = true },
+]
+response = { status = "string" }
+
+[commands.DELETE_LOG]
+syntax = "DELETE_LOG <log>"
+description = "Hard-delete all log state (entries, groups, pending, offset counter) and destroy the wrapped DEK to crypto-shred."
+acl = { namespace = "scroll.<log>", scope = "write" }
+parameters = [
+    { name = "log", type = "string", required = true },
+]
+response = { status = "string" }
+
+[commands.LOG_INFO]
+syntax = "LOG_INFO <log>"
+description = "Stats for a log: entries minted, latest offset, created-at, and list of reader groups."
+acl = { namespace = "scroll.<log>", scope = "read" }
+parameters = [
+    { name = "log", type = "string", required = true },
+]
+response = { log = "string", entries_minted = "integer", latest_offset = "integer?", groups = "array<string>", created_at_ms = "integer" }
+
+[commands.GROUP_INFO]
+syntax = "GROUP_INFO <log> <group>"
+description = "Stats for a reader group: cursor, members, and pending entry count."
+acl = { namespace = "scroll.<log>", scope = "read" }
+parameters = [
+    { name = "log", type = "string", required = true },
+    { name = "group", type = "string", required = true },
+]
+response = { log = "string", group = "string", last_delivered_offset = "integer", members = "array<ReaderMember>", pending_count = "integer", created_at_ms = "integer" }
+
+# ─── Meta commands ────────────────────────────────────────────────
+
+[commands.AUTH]
+syntax = "AUTH <token>"
+description = "Authenticate the connection. Consumed at the connection layer before dispatch."
+acl = "none"
+parameters = [
+    { name = "token", type = "string", required = true },
+]
+response = { status = "string" }
+
+[commands.HEALTH]
+syntax = "HEALTH"
+description = "Engine liveness probe."
+acl = "none"
+parameters = []
+response = { status = "string" }
+
+[commands.PING]
+syntax = "PING"
+description = "Connection liveness probe. Returns PONG."
+acl = "none"
+parameters = []
+response = "string"
+
+[commands.HELLO]
+syntax = "HELLO"
+description = "Engine identity + version + supported commands. Pre-auth version-detection handshake."
+acl = "none"
+parameters = []
+response = { engine = "string", version = "string", protocol = "string", commands = "array<string>", capabilities = "array<string>" }
+
+[commands."COMMAND LIST"]
+syntax = "COMMAND LIST"
+description = "List all supported commands with their syntax."
+acl = "none"
+parameters = []
+response = { commands = "array<string>" }
+
+# ─── Data-type references ─────────────────────────────────────────
+
+[types.LogEntry]
+description = "Single log entry as returned by READ / READ_GROUP. Payload is base64-encoded on wire."
+fields = [
+    { name = "offset", type = "integer" },
+    { name = "tenant_id", type = "string" },
+    { name = "log", type = "string" },
+    { name = "payload_b64", type = "base64" },
+    { name = "headers", type = "map<string, string>" },
+    { name = "appended_at_ms", type = "integer" },
+    { name = "expires_at_ms", type = "integer?" },
+]
+
+[types.ReaderMember]
+description = "Active member of a reader group."
+fields = [
+    { name = "reader_id", type = "string" },
+    { name = "last_seen_ms", type = "integer" },
+    { name = "in_flight", type = "integer" },
+]
