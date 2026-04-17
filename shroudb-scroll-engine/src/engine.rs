@@ -258,12 +258,7 @@ impl<S: Store> ScrollEngine<S> {
             return;
         };
         let mut event = Event::new(
-            // Pending shroudb-chronicle-core 1.9.0 publish — switch to
-            // `ChronicleEngine::Scroll` after bumping the dep. Tracked in
-            // TODOS.md. `Engine::Custom("scroll")` round-trips identically
-            // to the typed variant at the wire layer, so downstream
-            // consumers see the same string "scroll" either way.
-            ChronicleEngine::Custom("scroll".to_string()),
+            ChronicleEngine::Scroll,
             operation.to_string(),
             "scroll".to_string(),
             format!("{tenant_id}/{resource_id}"),

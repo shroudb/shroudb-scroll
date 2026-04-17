@@ -1763,9 +1763,9 @@ dependencies = [
 
 [[package]]
 name = "shroudb-chronicle-core"
-version = "1.8.0"
+version = "1.9.0"
 source = "sparse+https://crates.shroudb.dev/api/v1/crates/"
-checksum = "df270ffc9196c6bf87c2580491cb1dee8b6861059724a9d28146e767aed4944a"
+checksum = "60c56450f6f1556355794602ea54daa63e854eaebb26607c2617e1833e86d223"
 dependencies = [
  "serde",
  "serde_json",

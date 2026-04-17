@@ -26,7 +26,7 @@ shroudb-scroll-client = { path = "shroudb-scroll-client", version = "0.1.0", reg
 shroudb-cipher-client = { version = "1.5.0", registry = "shroudb" }
 
 shroudb-store = { version = "0.2.0", registry = "shroudb" }
-shroudb-chronicle-core = { version = "1.7.3", registry = "shroudb" }
+shroudb-chronicle-core = { version = "1.9.0", registry = "shroudb" }
 shroudb-acl = { version = "0.2.0", registry = "shroudb" }
 shroudb-crypto = { version = "0.1.4", registry = "shroudb" }
 shroudb-storage = { version = "0.4.0", registry = "shroudb" }
