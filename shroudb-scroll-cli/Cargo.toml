@@ -1,0 +1,20 @@
+[package]
+name = "shroudb-scroll-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "shroudb-scroll-cli"
+path = "src/main.rs"
+
+[dependencies]
+shroudb-scroll-core = { workspace = true }
+shroudb-scroll-client = { workspace = true }
+base64 = { workspace = true }
+tokio = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+serde_json = { workspace = true }
