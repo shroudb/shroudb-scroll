@@ -68,7 +68,13 @@ impl Default for EngineConfig {
             default_max_entry_bytes: 1_048_576,
             default_max_header_bytes: 16_384,
             default_retention_ttl_ms: None,
-            offset_cas_retry_max: 8,
+            // Offsets see much higher contention than group cursors:
+            // every APPEND on a given log races on `scroll.offsets`, whereas
+            // `scroll.groups` only sees readers-per-group contention. With
+            // N-way racing appenders, worst-case retries scale O(N), so 64
+            // buys headroom for bursty producers. Tune up for pathological
+            // contention (see SPEC §17 Q3 on fairness).
+            offset_cas_retry_max: 64,
             group_cursor_cas_retry_max: 8,
             max_delivery_count: 16,
             reader_idle_threshold_ms: 60_000,
@@ -2234,6 +2240,88 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(next, 5);
+    }
+
+    // ── Concurrency (SPEC §14) ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn concurrent_appends_mint_unique_monotonic_offsets() {
+        // N producers racing APPEND on the same log at default config — the
+        // CAS offset counter must hand out every u64 in [0, N) exactly once.
+        // N == offset_cas_retry_max so we exercise the ceiling.
+        const N: u64 = 64;
+        let eng = Arc::new(new_engine().await);
+
+        let mut handles = Vec::with_capacity(N as usize);
+        for i in 0..N {
+            let eng = eng.clone();
+            handles.push(tokio::spawn(async move {
+                eng.append("t", "l", vec![i as u8], BTreeMap::new(), None, &ctx())
+                    .await
+                    .expect("append failed")
+            }));
+        }
+        let mut offsets: Vec<u64> = Vec::with_capacity(N as usize);
+        for h in handles {
+            offsets.push(h.await.unwrap());
+        }
+        offsets.sort_unstable();
+        let expected: Vec<u64> = (0..N).collect();
+        assert_eq!(
+            offsets, expected,
+            "expected every offset in 0..{N} to be minted exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_read_groups_deliver_each_offset_once() {
+        // M readers race READ_GROUP on the same group. Every offset must be
+        // delivered to exactly one reader (no duplicate delivery without
+        // CLAIM). Matches the SPEC §7 exclusivity guarantee.
+        const ENTRIES: u64 = 40;
+        const READERS: usize = 5;
+        let eng = Arc::new(new_engine().await);
+
+        for i in 0..ENTRIES {
+            eng.append("t", "l", vec![i as u8], BTreeMap::new(), None, &ctx())
+                .await
+                .unwrap();
+        }
+        eng.create_group("t", "l", "g", 0, &ctx()).await.unwrap();
+
+        let mut handles = Vec::with_capacity(READERS);
+        for r in 0..READERS {
+            let eng = eng.clone();
+            let reader_id = format!("r{r}");
+            handles.push(tokio::spawn(async move {
+                let mut collected: Vec<u64> = Vec::new();
+                // Keep draining until READ_GROUP returns empty — hand-off
+                // between readers happens via CAS conflicts inside
+                // read_group; each call returns a disjoint batch.
+                loop {
+                    let batch = eng
+                        .read_group("t", "l", "g", &reader_id, 5, &ctx())
+                        .await
+                        .expect("read_group failed");
+                    if batch.is_empty() {
+                        break;
+                    }
+                    collected.extend(batch.iter().map(|e| e.offset));
+                }
+                collected
+            }));
+        }
+
+        let mut all: Vec<u64> = Vec::new();
+        for h in handles {
+            all.extend(h.await.unwrap());
+        }
+        all.sort_unstable();
+        let expected: Vec<u64> = (0..ENTRIES).collect();
+        assert_eq!(
+            all, expected,
+            "every offset 0..{ENTRIES} must be delivered exactly once across all readers"
+        );
     }
 
     // ── Cross-tenant isolation ──────────────────────────────────────────

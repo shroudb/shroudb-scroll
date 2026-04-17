@@ -231,8 +231,9 @@ default_max_header_bytes = 16_384
 default_max_delivery_count = 16    # move to DLQ above this
 
 # Group / reader
-reader_idle_threshold_ms = 60_000   # default min_idle_ms for CLAIM suggestions
-group_cursor_cas_retry_max = 8
+reader_idle_threshold_ms = 60_000    # default min_idle_ms for CLAIM suggestions
+offset_cas_retry_max = 64            # O(N) worst case with N contending appenders
+group_cursor_cas_retry_max = 8       # group cursor sees readers-per-group contention only
 
 # Tail
 tail_subscribe_buffer = 1024

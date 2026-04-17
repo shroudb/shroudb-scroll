@@ -90,3 +90,16 @@ Skipping any step means the release is incomplete.
 - **Upstream (required):** shroudb-store (v0.2+ for CAS/TTL/delete_prefix), shroudb-acl, shroudb-crypto, shroudb-chronicle-core (for the `ChronicleOps` trait only — the audit engine itself is optional), shroudb-storage, shroudb-protocol-wire, shroudb-telemetry
 - **Downstream:** shroudb-moat (embeds scroll-engine + scroll-protocol), application consumers of durable event logs
 - **Engine integrations (optional via capability traits, not crate deps):** Cipher (for APPEND/READ/READ_GROUP), Sentry (ABAC gating), Chronicle (audit events on CREATE_GROUP/DELETE_LOG/DLQ)
+
+## No dated audit markdown files
+
+Audit findings live in two places:
+1. Failing tests named `debt_<n>_<what>_must_<expected>` (hard ratchet — no `#[ignore]`).
+2. This repo's `TODOS.md`, indexing the debt tests by ID and capturing cross-repo follow-ups.
+
+Do NOT create:
+- `ENGINE_REVIEW*.md`, `*_REVIEW*.md`, `AUDIT_*.md`, `REVIEW_*.md`
+- Any dated snapshot (`*_2026-*.md`, etc.)
+- Status / progress / summary markdown that ages out of date
+
+Past audits accumulated 17+ `ENGINE_REVIEW_v*.md` files claiming "zero open items, production-ready" while real gaps went unfixed. New agents read them as truth. The forcing function now is `cargo test -p <crate> debt_` — the tests are the source, `TODOS.md` is the index, and nothing else counts.
