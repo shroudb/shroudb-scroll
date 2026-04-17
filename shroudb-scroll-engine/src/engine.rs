@@ -6,17 +6,28 @@ use serde::{Deserialize, Serialize};
 use shroudb_acl::{PolicyEffect, PolicyPrincipal, PolicyRequest, PolicyResource};
 use shroudb_chronicle_core::event::{Engine as ChronicleEngine, Event, EventResult};
 use shroudb_scroll_core::{
-    AuditContext, LogEntry, PendingEntry, ReaderGroup, ReaderMember, ScrollError,
+    AuditContext, DlqEntry, LogEntry, PendingEntry, ReaderGroup, ReaderMember, ScrollError,
 };
-use shroudb_store::{NamespaceConfig, PutOptions, Store, StoreError};
+use shroudb_store::{
+    EventType, MetadataValue, NamespaceConfig, PutOptions, Store, StoreError, Subscription,
+    SubscriptionFilter,
+};
 
 use crate::capabilities::Capabilities;
 use crate::crypto::{build_aad, decrypt_entry, encrypt_entry};
-use crate::groups::{self, GROUPS_NS, PENDING_NS};
+use crate::groups::{self, DLQ_NS, GROUPS_NS, PENDING_NS};
 use crate::keys::{KeyManager, META_NS, ProvisionDefaults};
 use crate::offsets::{self, OFFSETS_NS};
 
 pub const LOGS_NS: &str = "scroll.logs";
+
+/// Selector for `trim`: keep most-recent N entries, or delete entries older
+/// than N milliseconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrimBy {
+    MaxLen(u64),
+    MaxAgeMs(i64),
+}
 
 /// Engine-level configuration. Defaults match the `[scroll]` section of SPEC §11.
 #[derive(Debug, Clone)]
@@ -31,6 +42,9 @@ pub struct EngineConfig {
     pub offset_cas_retry_max: u32,
     /// CAS retry budget for group cursor advancement per `READ_GROUP`.
     pub group_cursor_cas_retry_max: u32,
+    /// Once an entry's `delivery_count` reaches this value, a subsequent
+    /// `CLAIM` moves it to `scroll.dlq` instead of redelivering.
+    pub max_delivery_count: u32,
 }
 
 impl Default for EngineConfig {
@@ -41,6 +55,7 @@ impl Default for EngineConfig {
             default_retention_ttl_ms: None,
             offset_cas_retry_max: 8,
             group_cursor_cas_retry_max: 8,
+            max_delivery_count: 16,
         }
     }
 }
@@ -91,7 +106,7 @@ impl<S: Store> ScrollEngine<S> {
         config: EngineConfig,
     ) -> Result<Self, ScrollError> {
         let ns_config = NamespaceConfig::default();
-        for ns in [LOGS_NS, OFFSETS_NS, GROUPS_NS, PENDING_NS, META_NS] {
+        for ns in [LOGS_NS, OFFSETS_NS, GROUPS_NS, PENDING_NS, META_NS, DLQ_NS] {
             match store.namespace_create(ns, ns_config.clone()).await {
                 Ok(()) => tracing::debug!(namespace = ns, "created scroll namespace"),
                 Err(StoreError::NamespaceExists(_)) => {}
@@ -340,8 +355,13 @@ impl<S: Store> ScrollEngine<S> {
             let ciphertext = encrypt_entry(dek.as_bytes(), &plaintext, &aad)?;
 
             // Persist the ciphertext. TTL is entry-level; the Store sweeper
-            // deletes it when `expires_at_ms` is reached.
-            let mut opts = PutOptions::default();
+            // deletes it when `expires_at_ms` is reached. `appended_at_ms`
+            // is attached as Store metadata so TRIM MAX_AGE can filter
+            // without decrypting the payload (timestamps are not sensitive —
+            // see SPEC §19).
+            let mut meta = HashMap::new();
+            meta.insert("ts".to_string(), MetadataValue::Integer(now_ms));
+            let mut opts = PutOptions::default().with_metadata(meta);
             if let Some(exp) = expires_at_ms {
                 let now = now_ms;
                 let remaining = (exp - now).max(1) as u64;
@@ -611,6 +631,128 @@ impl<S: Store> ScrollEngine<S> {
         Ok(entries)
     }
 
+    /// CLAIM. Reassign stalled pending entries to `claimer_id`. For each
+    /// pending record in the group older than `min_idle_ms`, increment its
+    /// `delivery_count` under CAS and rewrite ownership to the claimer. If
+    /// the incremented count would cross `max_delivery_count`, the entry
+    /// moves to `scroll.dlq` instead (and is removed from pending). Returns
+    /// the offsets successfully claimed.
+    pub async fn claim(
+        &self,
+        tenant_id: &str,
+        log: &str,
+        group: &str,
+        claimer_id: &str,
+        min_idle_ms: i64,
+        ctx: &AuditContext,
+    ) -> Result<Vec<u64>, ScrollError> {
+        let resource = format!("{log}/{group}");
+        let result = async {
+            self.check_policy(tenant_id, &resource, "claim", ctx)
+                .await?;
+            let now = now_ms();
+            let idle_before = now.saturating_sub(min_idle_ms);
+            let prefix = groups::pending_prefix(tenant_id, log, group);
+            let mut cursor: Option<String> = None;
+            let mut claimed: Vec<u64> = Vec::new();
+            let mut dlq_moves: Vec<u64> = Vec::new();
+            loop {
+                let page = self
+                    .store
+                    .list(PENDING_NS, Some(&prefix), cursor.as_deref(), 256)
+                    .await
+                    .map_err(|e| ScrollError::Store(format!("pending list: {e}")))?;
+                for key in &page.keys {
+                    let entry = match self.store.get(PENDING_NS, key, None).await {
+                        Ok(e) => e,
+                        Err(StoreError::NotFound) => continue,
+                        Err(e) => {
+                            return Err(ScrollError::Store(format!("pending get: {e}")));
+                        }
+                    };
+                    let mut pending: PendingEntry = serde_json::from_slice(&entry.value)
+                        .map_err(|e| ScrollError::Store(format!("corrupt pending record: {e}")))?;
+                    if pending.delivered_at_ms > idle_before {
+                        continue; // Still fresh; not stale enough to claim.
+                    }
+                    let new_count = pending.delivery_count.saturating_add(1);
+                    if new_count > self.config.max_delivery_count {
+                        // Move to DLQ atomically from the caller's perspective:
+                        // put DLQ first, then delete pending. A crash between
+                        // leaves a duplicate DLQ record — acceptable vs. loss.
+                        let dlq_record = DlqEntry {
+                            offset: pending.offset,
+                            reader_id: pending.reader_id.clone(),
+                            delivered_at_ms: pending.delivered_at_ms,
+                            delivery_count: pending.delivery_count,
+                            moved_to_dlq_at_ms: now,
+                            reason: "max_delivery_count_exceeded".into(),
+                        };
+                        let dlq_bytes = serde_json::to_vec(&dlq_record)
+                            .map_err(|e| ScrollError::Internal(format!("dlq encode: {e}")))?;
+                        let dk = groups::dlq_key(tenant_id, log, pending.offset);
+                        self.store
+                            .put(DLQ_NS, &dk, &dlq_bytes, None)
+                            .await
+                            .map_err(|e| ScrollError::Store(format!("dlq put: {e}")))?;
+                        // Remove from pending. CAS on the pending version so we
+                        // don't race with another claimer.
+                        match self
+                            .store
+                            .delete_if_version(PENDING_NS, key, entry.version)
+                            .await
+                        {
+                            Ok(_) | Err(StoreError::NotFound) => {
+                                dlq_moves.push(pending.offset);
+                            }
+                            Err(StoreError::VersionConflict { .. }) => continue,
+                            Err(e) => {
+                                return Err(ScrollError::Store(format!("pending delete: {e}")));
+                            }
+                        }
+                    } else {
+                        pending.reader_id = claimer_id.to_string();
+                        pending.delivered_at_ms = now;
+                        pending.delivery_count = new_count;
+                        let bytes = serde_json::to_vec(&pending)
+                            .map_err(|e| ScrollError::Internal(format!("pending encode: {e}")))?;
+                        match self
+                            .store
+                            .put_if_version(PENDING_NS, key, &bytes, None, entry.version)
+                            .await
+                        {
+                            Ok(_) => claimed.push(pending.offset),
+                            Err(StoreError::VersionConflict { .. }) => continue,
+                            Err(e) => {
+                                return Err(ScrollError::Store(format!("pending CAS: {e}")));
+                            }
+                        }
+                    }
+                }
+                match page.cursor {
+                    Some(c) => cursor = Some(c),
+                    None => break,
+                }
+            }
+            // Emit one audit event per DLQ move (per SPEC §10).
+            for offset in &dlq_moves {
+                self.emit_audit(
+                    "DLQ_MOVE",
+                    tenant_id,
+                    &format!("{log}/{group}/{offset}"),
+                    EventResult::Ok,
+                    ctx,
+                )
+                .await;
+            }
+            Ok(claimed)
+        }
+        .await;
+        self.emit_audit("CLAIM", tenant_id, &resource, event_result(&result), ctx)
+            .await;
+        result
+    }
+
     /// ACK. Idempotent: a double-ack returns Ok.
     pub async fn ack(
         &self,
@@ -715,6 +857,204 @@ impl<S: Store> ScrollEngine<S> {
             pending_count,
             created_at_ms: g.created_at_ms,
         })
+    }
+
+    /// TAIL. Live-tail reader: returns at most `limit` entries at or after
+    /// `from_offset`, waiting up to `timeout_ms` for new appends if the log
+    /// doesn't already have `limit` entries in range.
+    ///
+    /// Sentry-gated; no audit (reads are not audited). Requires Cipher (every
+    /// entry is decrypted before returning).
+    ///
+    /// Implementation: first drains already-persisted entries via READ, then
+    /// subscribes to the `scroll.logs` namespace and filters on the
+    /// `{tenant}/{log}/` prefix to collect new appends. Subscribe closure
+    /// before `limit` is reached surfaces as `TailOverflow` — the client is
+    /// expected to fall back to `READ` with an explicit offset.
+    pub async fn tail(
+        &self,
+        tenant_id: &str,
+        log: &str,
+        from_offset: u64,
+        limit: u32,
+        timeout_ms: u64,
+        ctx: &AuditContext,
+    ) -> Result<Vec<LogEntry>, ScrollError> {
+        self.check_policy(tenant_id, log, "tail", ctx).await?;
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let (dek, _meta) = self
+            .keys
+            .get_existing(self.store.as_ref(), self.require_cipher()?, tenant_id, log)
+            .await?;
+
+        // Drain the already-persisted tail first.
+        let mut collected = self.read(tenant_id, log, from_offset, limit, ctx).await?;
+        if collected.len() >= limit as usize {
+            return Ok(collected);
+        }
+
+        // Subscribe before computing `next_seen` so we don't race past an append
+        // that landed between the read above and the subscribe below.
+        let filter = SubscriptionFilter {
+            key: None,
+            events: vec![EventType::Put],
+        };
+        let mut sub = self
+            .store
+            .subscribe(LOGS_NS, filter)
+            .await
+            .map_err(|e| ScrollError::Store(format!("subscribe: {e}")))?;
+
+        // Filter events by tenant/log prefix; advance `next_seen` so we ignore
+        // duplicates for offsets already pulled by READ.
+        let prefix = Self::entry_prefix(tenant_id, log);
+        let mut next_seen = match collected.last() {
+            Some(e) => e.offset.saturating_add(1),
+            None => from_offset,
+        };
+
+        let deadline =
+            tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms.max(1));
+
+        while collected.len() < limit as usize {
+            let event = match tokio::time::timeout_at(deadline, sub.recv()).await {
+                Ok(Some(ev)) => ev,
+                // Timeout reached — return whatever we've accumulated.
+                Err(_) => break,
+                // Subscription closed before we met the limit — treat as overflow.
+                Ok(None) => return Err(ScrollError::TailOverflow),
+            };
+            if !event.key.starts_with(&prefix) {
+                continue;
+            }
+            let offset = offset_from_entry_key(&event.key)?;
+            if offset < next_seen {
+                continue;
+            }
+            let ct = match self.store.get(LOGS_NS, &event.key, None).await {
+                Ok(e) => e.value,
+                Err(StoreError::NotFound) => continue,
+                Err(e) => return Err(ScrollError::Store(format!("entry get: {e}"))),
+            };
+            let aad = build_aad(tenant_id, log, offset);
+            let pt = decrypt_entry(dek.as_bytes(), &ct, &aad)?;
+            let entry: LogEntry = serde_json::from_slice(&pt)
+                .map_err(|e| ScrollError::Store(format!("corrupt entry: {e}")))?;
+            next_seen = offset.saturating_add(1);
+            collected.push(entry);
+        }
+        Ok(collected)
+    }
+
+    /// TRIM. Retention enforcement. `MaxLen(n)` keeps only the most recent
+    /// `n` offsets by deleting everything below `next_offset - n`.
+    /// `MaxAgeMs(ms)` deletes every entry whose Store-metadata `ts` is older
+    /// than `now - ms`. Returns the number of entries actually deleted.
+    pub async fn trim(
+        &self,
+        tenant_id: &str,
+        log: &str,
+        by: TrimBy,
+        ctx: &AuditContext,
+    ) -> Result<u64, ScrollError> {
+        let result = async {
+            self.check_policy(tenant_id, log, "trim", ctx).await?;
+            match by {
+                TrimBy::MaxLen(keep) => self.trim_max_len(tenant_id, log, keep).await,
+                TrimBy::MaxAgeMs(age_ms) => self.trim_max_age(tenant_id, log, age_ms).await,
+            }
+        }
+        .await;
+        self.emit_audit("TRIM", tenant_id, log, event_result(&result), ctx)
+            .await;
+        result
+    }
+
+    async fn trim_max_len(
+        &self,
+        tenant_id: &str,
+        log: &str,
+        keep: u64,
+    ) -> Result<u64, ScrollError> {
+        let next = self.current_next_offset(tenant_id, log).await?;
+        if next <= keep {
+            return Ok(0);
+        }
+        let threshold = next - keep; // delete offsets strictly less than this
+        let mut deleted: u64 = 0;
+        let prefix = Self::entry_prefix(tenant_id, log);
+        let mut cursor: Option<String> = None;
+        loop {
+            let page = self
+                .store
+                .list(LOGS_NS, Some(&prefix), cursor.as_deref(), 256)
+                .await
+                .map_err(|e| ScrollError::Store(format!("entry list: {e}")))?;
+            for key in &page.keys {
+                let offset = offset_from_entry_key(key)?;
+                if offset >= threshold {
+                    continue;
+                }
+                match self.store.delete(LOGS_NS, key).await {
+                    Ok(_) => deleted += 1,
+                    Err(StoreError::NotFound) => {}
+                    Err(e) => return Err(ScrollError::Store(format!("entry delete: {e}"))),
+                }
+            }
+            match page.cursor {
+                Some(c) => cursor = Some(c),
+                None => break,
+            }
+        }
+        Ok(deleted)
+    }
+
+    async fn trim_max_age(
+        &self,
+        tenant_id: &str,
+        log: &str,
+        age_ms: i64,
+    ) -> Result<u64, ScrollError> {
+        let cutoff = now_ms().saturating_sub(age_ms);
+        let mut deleted: u64 = 0;
+        let prefix = Self::entry_prefix(tenant_id, log);
+        let mut cursor: Option<String> = None;
+        loop {
+            let page = self
+                .store
+                .list(LOGS_NS, Some(&prefix), cursor.as_deref(), 256)
+                .await
+                .map_err(|e| ScrollError::Store(format!("entry list: {e}")))?;
+            for key in &page.keys {
+                let entry = match self.store.get(LOGS_NS, key, None).await {
+                    Ok(e) => e,
+                    Err(StoreError::NotFound) => continue,
+                    Err(e) => return Err(ScrollError::Store(format!("entry get: {e}"))),
+                };
+                let ts = match entry.metadata.get("ts") {
+                    Some(MetadataValue::Integer(i)) => *i,
+                    // Entries written before the metadata convention are never
+                    // reaped by MAX_AGE — safer than guessing. They can still
+                    // be reaped by MAX_LEN.
+                    _ => continue,
+                };
+                if ts >= cutoff {
+                    continue;
+                }
+                match self.store.delete(LOGS_NS, key).await {
+                    Ok(_) => deleted += 1,
+                    Err(StoreError::NotFound) => {}
+                    Err(e) => return Err(ScrollError::Store(format!("entry delete: {e}"))),
+                }
+            }
+            match page.cursor {
+                Some(c) => cursor = Some(c),
+                None => break,
+            }
+        }
+        Ok(deleted)
     }
 
     /// DELETE_LOG. Hard teardown: data → groups → pending → offsets → DEK.
@@ -1527,6 +1867,208 @@ mod tests {
         // Only APPEND should be in the log.
         let ops: Vec<String> = chron.events().iter().map(|e| e.operation.clone()).collect();
         assert_eq!(ops, vec!["APPEND"]);
+    }
+
+    // ── TAIL ────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn tail_returns_already_persisted_entries() {
+        let eng = new_engine().await;
+        for i in 0..3u8 {
+            eng.append("t", "l", vec![i], BTreeMap::new(), None, &ctx())
+                .await
+                .unwrap();
+        }
+        // All 3 already persisted — TAIL should return without waiting.
+        let got = eng.tail("t", "l", 0, 10, 500, &ctx()).await.unwrap();
+        assert_eq!(got.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn tail_waits_for_new_appends() {
+        let eng = Arc::new(new_engine().await);
+        // Log must exist (has DEK / meta) before tail can decrypt.
+        eng.append("t", "l", b"seed".to_vec(), BTreeMap::new(), None, &ctx())
+            .await
+            .unwrap();
+
+        let writer = eng.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            for i in 0..2u8 {
+                let _ = writer
+                    .append("t", "l", vec![i], BTreeMap::new(), None, &ctx())
+                    .await;
+            }
+        });
+
+        // Start tail at offset 1 (after the seed) — expect the 2 upcoming.
+        let got = eng.tail("t", "l", 1, 2, 2_000, &ctx()).await.unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].offset, 1);
+        assert_eq!(got[1].offset, 2);
+    }
+
+    #[tokio::test]
+    async fn tail_timeout_returns_partial() {
+        let eng = new_engine().await;
+        eng.append("t", "l", b"seed".to_vec(), BTreeMap::new(), None, &ctx())
+            .await
+            .unwrap();
+        // Ask for more than exist; no writer publishes; short timeout.
+        let got = eng.tail("t", "l", 0, 10, 50, &ctx()).await.unwrap();
+        assert_eq!(got.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn tail_zero_limit_returns_empty() {
+        let eng = new_engine().await;
+        let got = eng.tail("t", "l", 0, 0, 100, &ctx()).await.unwrap();
+        assert!(got.is_empty());
+    }
+
+    // ── CLAIM + DLQ ─────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn claim_skips_fresh_entries() {
+        let eng = new_engine().await;
+        eng.append("t", "l", b"x".to_vec(), BTreeMap::new(), None, &ctx())
+            .await
+            .unwrap();
+        eng.create_group("t", "l", "g", 0, &ctx()).await.unwrap();
+        eng.read_group("t", "l", "g", "r1", 10, &ctx())
+            .await
+            .unwrap();
+        // Entry just delivered — not idle yet.
+        let claimed = eng
+            .claim("t", "l", "g", "r2", 60_000, &ctx())
+            .await
+            .unwrap();
+        assert!(claimed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn claim_reassigns_stale_entries() {
+        let eng = new_engine().await;
+        for i in 0..3u8 {
+            eng.append("t", "l", vec![i], BTreeMap::new(), None, &ctx())
+                .await
+                .unwrap();
+        }
+        eng.create_group("t", "l", "g", 0, &ctx()).await.unwrap();
+        eng.read_group("t", "l", "g", "r1", 10, &ctx())
+            .await
+            .unwrap();
+        // min_idle_ms = 0 → every pending entry is "stale enough" to claim.
+        let claimed = eng.claim("t", "l", "g", "r2", 0, &ctx()).await.unwrap();
+        assert_eq!(claimed.len(), 3);
+        // Pending records now owned by r2 with delivery_count=2.
+        let info = eng.group_info("t", "l", "g", &ctx()).await.unwrap();
+        assert_eq!(info.pending_count, 3);
+    }
+
+    #[tokio::test]
+    async fn claim_moves_to_dlq_on_delivery_breach() {
+        // Use a tiny max_delivery_count so repeated CLAIMs tip over quickly.
+        let store = shroudb_storage::test_util::create_test_store("scroll-dlq").await;
+        let caps = Capabilities::new().with_cipher(FakeCipher::new());
+        let cfg = EngineConfig {
+            max_delivery_count: 2,
+            ..EngineConfig::default()
+        };
+        let eng = ScrollEngine::new(store, caps, cfg).await.unwrap();
+
+        eng.append("t", "l", b"x".to_vec(), BTreeMap::new(), None, &ctx())
+            .await
+            .unwrap();
+        eng.create_group("t", "l", "g", 0, &ctx()).await.unwrap();
+        eng.read_group("t", "l", "g", "r1", 10, &ctx())
+            .await
+            .unwrap();
+        // delivery_count starts at 1 after READ_GROUP.
+        let first = eng.claim("t", "l", "g", "r2", 0, &ctx()).await.unwrap();
+        assert_eq!(first, vec![0]); // claimed, now delivery_count = 2
+        let second = eng.claim("t", "l", "g", "r3", 0, &ctx()).await.unwrap();
+        assert!(
+            second.is_empty(),
+            "third attempt should DLQ, not claim: {second:?}"
+        );
+
+        // Pending cleared, DLQ populated.
+        let info = eng.group_info("t", "l", "g", &ctx()).await.unwrap();
+        assert_eq!(info.pending_count, 0);
+    }
+
+    // ── TRIM ────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn trim_max_len_deletes_oldest() {
+        let eng = new_engine().await;
+        for i in 0..10u8 {
+            eng.append("t", "l", vec![i], BTreeMap::new(), None, &ctx())
+                .await
+                .unwrap();
+        }
+        let deleted = eng.trim("t", "l", TrimBy::MaxLen(3), &ctx()).await.unwrap();
+        assert_eq!(deleted, 7);
+        // Only the latest 3 should remain.
+        let got = eng.read("t", "l", 0, 100, &ctx()).await.unwrap();
+        let offsets: Vec<u64> = got.iter().map(|e| e.offset).collect();
+        assert_eq!(offsets, vec![7, 8, 9]);
+    }
+
+    #[tokio::test]
+    async fn trim_max_len_noop_when_below_cap() {
+        let eng = new_engine().await;
+        for i in 0..3u8 {
+            eng.append("t", "l", vec![i], BTreeMap::new(), None, &ctx())
+                .await
+                .unwrap();
+        }
+        let deleted = eng
+            .trim("t", "l", TrimBy::MaxLen(10), &ctx())
+            .await
+            .unwrap();
+        assert_eq!(deleted, 0);
+        let got = eng.read("t", "l", 0, 100, &ctx()).await.unwrap();
+        assert_eq!(got.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn trim_max_age_deletes_older_entries() {
+        // With age_ms = 0, every existing entry is older than the cutoff.
+        let eng = new_engine().await;
+        for i in 0..5u8 {
+            eng.append("t", "l", vec![i], BTreeMap::new(), None, &ctx())
+                .await
+                .unwrap();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let deleted = eng
+            .trim("t", "l", TrimBy::MaxAgeMs(1), &ctx())
+            .await
+            .unwrap();
+        assert_eq!(deleted, 5);
+        let got = eng.read("t", "l", 0, 100, &ctx()).await.unwrap();
+        assert!(got.is_empty());
+    }
+
+    #[tokio::test]
+    async fn trim_preserves_offsets_counter() {
+        // After TRIM, new APPENDs continue from the next un-minted offset —
+        // trim doesn't reset the counter.
+        let eng = new_engine().await;
+        for i in 0..5u8 {
+            eng.append("t", "l", vec![i], BTreeMap::new(), None, &ctx())
+                .await
+                .unwrap();
+        }
+        eng.trim("t", "l", TrimBy::MaxLen(2), &ctx()).await.unwrap();
+        let next = eng
+            .append("t", "l", b"z".to_vec(), BTreeMap::new(), None, &ctx())
+            .await
+            .unwrap();
+        assert_eq!(next, 5);
     }
 
     // ── Cross-tenant isolation ──────────────────────────────────────────

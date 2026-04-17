@@ -3,6 +3,11 @@ use shroudb_store::{Store, StoreError};
 
 pub const GROUPS_NS: &str = "scroll.groups";
 pub const PENDING_NS: &str = "scroll.pending";
+pub const DLQ_NS: &str = "scroll.dlq";
+
+pub fn dlq_key(tenant_id: &str, log: &str, offset: u64) -> Vec<u8> {
+    format!("{tenant_id}/{log}/{offset:020}").into_bytes()
+}
 
 pub fn group_key(tenant_id: &str, log: &str, group: &str) -> Vec<u8> {
     format!("{tenant_id}/{log}/{group}").into_bytes()

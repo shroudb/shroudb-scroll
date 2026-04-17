@@ -1,5 +1,14 @@
 use shroudb_acl::{AclRequirement, Scope};
 
+/// Parsed `TRIM` selector. Mirrors `shroudb_scroll_engine::TrimBy` but lives
+/// in the protocol crate so we don't leak an engine dependency through the
+/// command enum's public surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrimArg {
+    MaxLen(u64),
+    MaxAgeMs(i64),
+}
+
 /// Parsed Scroll wire command. Every payload has already been pulled out of
 /// the RESP3 bulk-string array; further decoding (base64 → bytes, JSON →
 /// headers map) happens in `dispatch`.
@@ -46,6 +55,22 @@ pub enum ScrollCommand {
         log: String,
         group: String,
     },
+    Claim {
+        log: String,
+        group: String,
+        reader_id: String,
+        min_idle_ms: i64,
+    },
+    Trim {
+        log: String,
+        by: TrimArg,
+    },
+    Tail {
+        log: String,
+        from_offset: u64,
+        limit: u32,
+        timeout_ms: Option<u64>,
+    },
 
     // ── Meta commands ──────────────────────────────────────────────────
     Auth {
@@ -62,11 +87,15 @@ impl ScrollCommand {
     /// write scope. Meta commands require no ACL.
     pub fn acl_requirement(&self) -> AclRequirement {
         let (log, scope) = match self {
-            Self::Append { log, .. } | Self::DeleteLog { log } => (log.as_str(), Scope::Write),
+            Self::Append { log, .. } | Self::DeleteLog { log } | Self::Trim { log, .. } => {
+                (log.as_str(), Scope::Write)
+            }
             Self::CreateGroup { log, .. } => (log.as_str(), Scope::Write),
             Self::Read { log, .. }
             | Self::ReadGroup { log, .. }
             | Self::Ack { log, .. }
+            | Self::Claim { log, .. }
+            | Self::Tail { log, .. }
             | Self::LogInfo { log }
             | Self::GroupInfo { log, .. } => (log.as_str(), Scope::Read),
             Self::Auth { .. } | Self::Health | Self::Ping | Self::Hello | Self::CommandList => {
@@ -91,6 +120,9 @@ impl ScrollCommand {
             Self::DeleteLog { .. } => "DELETE_LOG",
             Self::LogInfo { .. } => "LOG_INFO",
             Self::GroupInfo { .. } => "GROUP_INFO",
+            Self::Claim { .. } => "CLAIM",
+            Self::Trim { .. } => "TRIM",
+            Self::Tail { .. } => "TAIL",
             Self::Auth { .. } => "AUTH",
             Self::Health => "HEALTH",
             Self::Ping => "PING",
@@ -113,6 +145,9 @@ pub fn parse_command(args: &[&str]) -> Result<ScrollCommand, String> {
         "DELETE_LOG" => parse_delete_log(&args[1..]),
         "LOG_INFO" => parse_log_info(&args[1..]),
         "GROUP_INFO" => parse_group_info(&args[1..]),
+        "CLAIM" => parse_claim(&args[1..]),
+        "TRIM" => parse_trim(&args[1..]),
+        "TAIL" => parse_tail(&args[1..]),
         "AUTH" => {
             let token = args
                 .get(1)
@@ -253,6 +288,78 @@ fn parse_group_info(args: &[&str]) -> Result<ScrollCommand, String> {
     Ok(ScrollCommand::GroupInfo {
         log: args[0].to_string(),
         group: args[1].to_string(),
+    })
+}
+
+fn parse_claim(args: &[&str]) -> Result<ScrollCommand, String> {
+    if args.len() != 4 {
+        return Err("CLAIM requires <log> <group> <reader_id> <min_idle_ms>".into());
+    }
+    Ok(ScrollCommand::Claim {
+        log: args[0].to_string(),
+        group: args[1].to_string(),
+        reader_id: args[2].to_string(),
+        min_idle_ms: args[3]
+            .parse::<i64>()
+            .map_err(|_| format!("min_idle_ms must be i64 (got {})", args[3]))?,
+    })
+}
+
+fn parse_trim(args: &[&str]) -> Result<ScrollCommand, String> {
+    if args.len() != 3 {
+        return Err("TRIM requires <log> MAX_LEN <n> or <log> MAX_AGE <ms>".into());
+    }
+    let log = args[0].to_string();
+    let by = match args[1].to_ascii_uppercase().as_str() {
+        "MAX_LEN" => TrimArg::MaxLen(
+            args[2]
+                .parse::<u64>()
+                .map_err(|_| format!("MAX_LEN value must be u64 (got {})", args[2]))?,
+        ),
+        "MAX_AGE" => TrimArg::MaxAgeMs(
+            args[2]
+                .parse::<i64>()
+                .map_err(|_| format!("MAX_AGE value must be i64 (got {})", args[2]))?,
+        ),
+        other => return Err(format!("unknown TRIM selector: {other}")),
+    };
+    Ok(ScrollCommand::Trim { log, by })
+}
+
+fn parse_tail(args: &[&str]) -> Result<ScrollCommand, String> {
+    if args.len() < 3 {
+        return Err("TAIL requires <log> <from_offset> <limit> [TIMEOUT <ms>]".into());
+    }
+    let log = args[0].to_string();
+    let from_offset = args[1]
+        .parse::<u64>()
+        .map_err(|_| format!("from_offset must be u64 (got {})", args[1]))?;
+    let limit = args[2]
+        .parse::<u32>()
+        .map_err(|_| format!("limit must be u32 (got {})", args[2]))?;
+    let mut timeout_ms: Option<u64> = None;
+    let mut i = 3;
+    while i < args.len() {
+        match args[i].to_ascii_uppercase().as_str() {
+            "TIMEOUT" => {
+                i += 1;
+                let v = args
+                    .get(i)
+                    .ok_or_else(|| "TIMEOUT requires a millisecond value".to_string())?;
+                timeout_ms = Some(
+                    v.parse::<u64>()
+                        .map_err(|_| format!("TIMEOUT must be u64 (got {v})"))?,
+                );
+            }
+            other => return Err(format!("unknown TAIL option: {other}")),
+        }
+        i += 1;
+    }
+    Ok(ScrollCommand::Tail {
+        log,
+        from_offset,
+        limit,
+        timeout_ms,
     })
 }
 

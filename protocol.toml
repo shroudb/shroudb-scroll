@@ -111,6 +111,41 @@ parameters = [
 ]
 response = { status = "string" }
 
+[commands.CLAIM]
+syntax = "CLAIM <log> <group> <reader_id> <min_idle_ms>"
+description = "Reassign stalled pending entries to a new reader. Entries whose delivery_count would cross max_delivery_count are moved to scroll.dlq instead."
+acl = { namespace = "scroll.<log>", scope = "read" }
+parameters = [
+    { name = "log", type = "string", required = true },
+    { name = "group", type = "string", required = true },
+    { name = "reader_id", type = "string", required = true, description = "Claimant — becomes the new owner of reassigned pendings" },
+    { name = "min_idle_ms", type = "integer", required = true, description = "Only claim entries whose last delivery was older than this" },
+]
+response = { status = "string", claimed = "array<integer>" }
+
+[commands.TRIM]
+syntax = "TRIM <log> MAX_LEN <n> | TRIM <log> MAX_AGE <ms>"
+description = "Explicit retention. MAX_LEN keeps the most recent N offsets; MAX_AGE drops entries whose appended_at_ms is older than now-ms."
+acl = { namespace = "scroll.<log>", scope = "write" }
+parameters = [
+    { name = "log", type = "string", required = true },
+    { name = "selector", type = "string", required = true, description = "'MAX_LEN' or 'MAX_AGE'" },
+    { name = "value", type = "integer", required = true, description = "Entries to keep (MAX_LEN) or milliseconds (MAX_AGE)" },
+]
+response = { status = "string", deleted = "integer" }
+
+[commands.TAIL]
+syntax = "TAIL <log> <from_offset> <limit> [TIMEOUT <ms>]"
+description = "Live tail: returns at most limit entries at or after from_offset, waiting up to TIMEOUT ms (default 30_000) for new appends. Closes with TAIL_OVERFLOW on subscribe backpressure; client should fall back to READ."
+acl = { namespace = "scroll.<log>", scope = "read" }
+parameters = [
+    { name = "log", type = "string", required = true },
+    { name = "from_offset", type = "integer", required = true },
+    { name = "limit", type = "integer", required = true },
+    { name = "timeout_ms", type = "integer", required = false, description = "Server-side wait budget; default 30000" },
+]
+response = { status = "string", entries = "array<LogEntry>" }
+
 [commands.LOG_INFO]
 syntax = "LOG_INFO <log>"
 description = "Stats for a log: entries minted, latest offset, created-at, and list of reader groups."

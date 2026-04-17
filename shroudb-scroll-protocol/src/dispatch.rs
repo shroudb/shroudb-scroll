@@ -4,11 +4,12 @@ use shroudb_acl::AuthContext;
 use shroudb_protocol_wire::WIRE_PROTOCOL;
 use shroudb_scroll_core::AuditContext;
 use shroudb_scroll_engine::ScrollEngine;
+use shroudb_scroll_engine::engine::TrimBy;
 use shroudb_store::Store;
 use std::collections::BTreeMap;
 use tracing::warn;
 
-use crate::commands::{ScrollCommand, resolve_start_offset};
+use crate::commands::{ScrollCommand, TrimArg, resolve_start_offset};
 use crate::response::ScrollResponse;
 
 const SUPPORTED_COMMANDS: &[&str] = &[
@@ -20,6 +21,9 @@ const SUPPORTED_COMMANDS: &[&str] = &[
     "DELETE_LOG",
     "LOG_INFO",
     "GROUP_INFO",
+    "CLAIM",
+    "TRIM",
+    "TAIL",
     "AUTH",
     "HEALTH",
     "PING",
@@ -150,6 +154,55 @@ pub async fn dispatch<S: Store>(
             match engine.group_info(&tenant, &log, &group, &ctx).await {
                 Ok(info) => ScrollResponse::group_info(info),
                 Err(e) => ScrollResponse::error(e.to_string()),
+            }
+        }
+
+        ScrollCommand::Claim {
+            log,
+            group,
+            reader_id,
+            min_idle_ms,
+        } => match engine
+            .claim(&tenant, &log, &group, &reader_id, min_idle_ms, &ctx)
+            .await
+        {
+            Ok(offsets) => ScrollResponse::claimed(offsets),
+            Err(e) => {
+                warn!(log, group, error = %e, "CLAIM failed");
+                ScrollResponse::error(e.to_string())
+            }
+        },
+
+        ScrollCommand::Trim { log, by } => {
+            let engine_by = match by {
+                TrimArg::MaxLen(n) => TrimBy::MaxLen(n),
+                TrimArg::MaxAgeMs(ms) => TrimBy::MaxAgeMs(ms),
+            };
+            match engine.trim(&tenant, &log, engine_by, &ctx).await {
+                Ok(n) => ScrollResponse::trimmed(n),
+                Err(e) => {
+                    warn!(log, error = %e, "TRIM failed");
+                    ScrollResponse::error(e.to_string())
+                }
+            }
+        }
+
+        ScrollCommand::Tail {
+            log,
+            from_offset,
+            limit,
+            timeout_ms,
+        } => {
+            let t = timeout_ms.unwrap_or(30_000);
+            match engine
+                .tail(&tenant, &log, from_offset, limit, t, &ctx)
+                .await
+            {
+                Ok(entries) => ScrollResponse::entries(entries),
+                Err(e) => {
+                    warn!(log, error = %e, "TAIL failed");
+                    ScrollResponse::error(e.to_string())
+                }
             }
         }
     }
@@ -431,6 +484,71 @@ mod tests {
         // Subsequent LOG_INFO should fail (log gone).
         let resp = dispatch(&eng, parse_command(&["LOG_INFO", "l"]).unwrap(), None).await;
         assert!(matches!(resp, ScrollResponse::Error(_)));
+    }
+
+    #[tokio::test]
+    async fn claim_via_dispatch_reassigns() {
+        let eng = new_engine().await;
+        dispatch(&eng, parse_command(&["APPEND", "l", "YQ=="]).unwrap(), None).await;
+        dispatch(
+            &eng,
+            parse_command(&["CREATE_GROUP", "l", "g", "0"]).unwrap(),
+            None,
+        )
+        .await;
+        dispatch(
+            &eng,
+            parse_command(&["READ_GROUP", "l", "g", "r1", "10"]).unwrap(),
+            None,
+        )
+        .await;
+        // min_idle_ms = 0 → the just-delivered entry is immediately claimable.
+        let resp = dispatch(
+            &eng,
+            parse_command(&["CLAIM", "l", "g", "r2", "0"]).unwrap(),
+            None,
+        )
+        .await;
+        let body = ok_body(resp);
+        assert_eq!(body["claimed"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn trim_max_len_via_dispatch() {
+        let eng = new_engine().await;
+        for _ in 0..5 {
+            dispatch(&eng, parse_command(&["APPEND", "l", "YQ=="]).unwrap(), None).await;
+        }
+        let resp = dispatch(
+            &eng,
+            parse_command(&["TRIM", "l", "MAX_LEN", "2"]).unwrap(),
+            None,
+        )
+        .await;
+        let body = ok_body(resp);
+        assert_eq!(body["deleted"], 3);
+    }
+
+    #[tokio::test]
+    async fn trim_rejects_unknown_selector() {
+        // Parse error caught at the commands layer.
+        assert!(parse_command(&["TRIM", "l", "MAX_JUNK", "10"]).is_err());
+    }
+
+    #[tokio::test]
+    async fn tail_via_dispatch_returns_existing_entries() {
+        let eng = new_engine().await;
+        for _ in 0..2 {
+            dispatch(&eng, parse_command(&["APPEND", "l", "YQ=="]).unwrap(), None).await;
+        }
+        let resp = dispatch(
+            &eng,
+            parse_command(&["TAIL", "l", "0", "10", "TIMEOUT", "200"]).unwrap(),
+            None,
+        )
+        .await;
+        let body = ok_body(resp);
+        assert_eq!(body["entries"].as_array().unwrap().len(), 2);
     }
 
     #[tokio::test]

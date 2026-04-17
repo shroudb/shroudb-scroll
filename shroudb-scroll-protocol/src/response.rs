@@ -64,6 +64,14 @@ impl ScrollResponse {
         Self::Ok(serde_json::to_value(info).unwrap_or_else(|_| json!({"status": "error"})))
     }
 
+    pub fn claimed(offsets: Vec<u64>) -> Self {
+        Self::Ok(json!({"status": "ok", "claimed": offsets}))
+    }
+
+    pub fn trimmed(count: u64) -> Self {
+        Self::Ok(json!({"status": "ok", "deleted": count}))
+    }
+
     pub fn command_list() -> Self {
         Self::Ok(json!({
             "commands": [
@@ -75,6 +83,9 @@ impl ScrollResponse {
                 "DELETE_LOG <log>",
                 "LOG_INFO <log>",
                 "GROUP_INFO <log> <group>",
+                "CLAIM <log> <group> <reader_id> <min_idle_ms>",
+                "TRIM <log> MAX_LEN <n> | MAX_AGE <ms>",
+                "TAIL <log> <from_offset> <limit> [TIMEOUT <ms>]",
                 "AUTH <token>",
                 "HEALTH",
                 "PING",
@@ -82,5 +93,78 @@ impl ScrollResponse {
                 "COMMAND LIST",
             ]
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ok(r: ScrollResponse) -> Value {
+        match r {
+            ScrollResponse::Ok(v) => v,
+            ScrollResponse::Error(e) => panic!("expected Ok, got Error({e})"),
+        }
+    }
+
+    #[test]
+    fn ok_status_shape() {
+        assert_eq!(ok(ScrollResponse::ok_status())["status"], "ok");
+    }
+
+    #[test]
+    fn pong_shape() {
+        assert_eq!(ok(ScrollResponse::pong()), json!("PONG"));
+    }
+
+    #[test]
+    fn append_result_includes_offset() {
+        let v = ok(ScrollResponse::append_result(42));
+        assert_eq!(v["status"], "ok");
+        assert_eq!(v["offset"], 42);
+    }
+
+    #[test]
+    fn claimed_lists_offsets() {
+        let v = ok(ScrollResponse::claimed(vec![1, 2, 5]));
+        assert_eq!(v["claimed"].as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn trimmed_reports_count() {
+        let v = ok(ScrollResponse::trimmed(7));
+        assert_eq!(v["deleted"], 7);
+    }
+
+    #[test]
+    fn entries_base64_encodes_payload() {
+        let entries = vec![LogEntry::new(
+            0,
+            "t".into(),
+            "l".into(),
+            b"hello".to_vec(),
+            std::collections::BTreeMap::new(),
+            1,
+            None,
+        )];
+        let v = ok(ScrollResponse::entries(entries));
+        assert_eq!(v["entries"][0]["payload_b64"], "aGVsbG8=");
+    }
+
+    #[test]
+    fn command_list_covers_all_p1_commands() {
+        let v = ok(ScrollResponse::command_list());
+        let cmds: Vec<&str> = v["commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s.as_str().unwrap())
+            .collect();
+        for expected in ["APPEND", "CLAIM", "TRIM", "TAIL", "COMMAND LIST"] {
+            assert!(
+                cmds.iter().any(|c| c.contains(expected)),
+                "missing {expected}"
+            );
+        }
     }
 }
