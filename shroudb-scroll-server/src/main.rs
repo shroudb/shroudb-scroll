@@ -102,6 +102,10 @@ async fn run_server<S: Store + 'static>(
         offset_cas_retry_max: cfg.engine.offset_cas_retry_max,
         group_cursor_cas_retry_max: cfg.engine.group_cursor_cas_retry_max,
         max_delivery_count: cfg.engine.max_delivery_count,
+        reader_idle_threshold_ms: cfg.engine.reader_idle_threshold_ms,
+        tail_default_timeout_ms: cfg.engine.tail_default_timeout_ms,
+        tail_subscribe_buffer: cfg.engine.tail_subscribe_buffer,
+        dlq_retention_ttl_ms: cfg.engine.dlq_retention_ttl_ms,
     };
     let engine = Arc::new(
         ScrollEngine::new(store, caps, engine_config)

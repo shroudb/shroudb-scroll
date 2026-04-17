@@ -80,6 +80,14 @@ pub struct EngineConfig {
     pub group_cursor_cas_retry_max: u32,
     #[serde(default = "default_max_delivery_count")]
     pub max_delivery_count: u32,
+    #[serde(default = "default_reader_idle_threshold_ms")]
+    pub reader_idle_threshold_ms: i64,
+    #[serde(default = "default_tail_timeout_ms")]
+    pub tail_default_timeout_ms: u64,
+    #[serde(default = "default_tail_buffer")]
+    pub tail_subscribe_buffer: usize,
+    #[serde(default = "default_dlq_ttl_ms")]
+    pub dlq_retention_ttl_ms: Option<i64>,
 }
 
 impl Default for EngineConfig {
@@ -91,6 +99,10 @@ impl Default for EngineConfig {
             offset_cas_retry_max: 8,
             group_cursor_cas_retry_max: 8,
             max_delivery_count: 16,
+            reader_idle_threshold_ms: default_reader_idle_threshold_ms(),
+            tail_default_timeout_ms: default_tail_timeout_ms(),
+            tail_subscribe_buffer: default_tail_buffer(),
+            dlq_retention_ttl_ms: default_dlq_ttl_ms(),
         }
     }
 }
@@ -106,6 +118,18 @@ fn default_cas_retry() -> u32 {
 }
 fn default_max_delivery_count() -> u32 {
     16
+}
+fn default_reader_idle_threshold_ms() -> i64 {
+    60_000
+}
+fn default_tail_timeout_ms() -> u64 {
+    30_000
+}
+fn default_tail_buffer() -> usize {
+    1024
+}
+fn default_dlq_ttl_ms() -> Option<i64> {
+    Some(2_592_000_000)
 }
 
 /// Remote Cipher wiring. `addr` is a TCP `host:port`; `keyring` is the

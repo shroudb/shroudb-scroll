@@ -45,6 +45,21 @@ pub struct EngineConfig {
     /// Once an entry's `delivery_count` reaches this value, a subsequent
     /// `CLAIM` moves it to `scroll.dlq` instead of redelivering.
     pub max_delivery_count: u32,
+    /// Default `min_idle_ms` recommended to `CLAIM` callers; also used as the
+    /// idle threshold below which a reader is considered "fresh" in
+    /// `GROUP_INFO` member listings. Operators tune this to their reader
+    /// polling cadence (SPEC §11 `reader_idle_threshold_ms`).
+    pub reader_idle_threshold_ms: i64,
+    /// Default `TAIL` wait budget when the caller omits `TIMEOUT`.
+    pub tail_default_timeout_ms: u64,
+    /// Buffer size the Store-subscribe channel is configured with for `TAIL`.
+    /// If a `TAIL` consumer falls behind this many events, the subscription
+    /// closes and the call returns `TailOverflow`.
+    pub tail_subscribe_buffer: usize,
+    /// TTL applied to `scroll.dlq` entries at write time. `None` means DLQ
+    /// entries live forever (operators must drain out-of-band). SPEC §11
+    /// default: 30 days.
+    pub dlq_retention_ttl_ms: Option<i64>,
 }
 
 impl Default for EngineConfig {
@@ -56,6 +71,10 @@ impl Default for EngineConfig {
             offset_cas_retry_max: 8,
             group_cursor_cas_retry_max: 8,
             max_delivery_count: 16,
+            reader_idle_threshold_ms: 60_000,
+            tail_default_timeout_ms: 30_000,
+            tail_subscribe_buffer: 1024,
+            dlq_retention_ttl_ms: Some(2_592_000_000), // 30 days
         }
     }
 }
@@ -377,6 +396,19 @@ impl<S: Store> ScrollEngine<S> {
             Ok(offset)
         }
         .await;
+        if let Ok(offset) = result {
+            // SPEC §13: scroll_appends_total{tenant,log}. `entries_minted` is
+            // `offset + 1` (monotonic), exposing the `scroll_entries_stored`
+            // gauge signal without a second Store round-trip.
+            tracing::info!(
+                target: "scroll::metrics",
+                metric = "appends_total",
+                tenant = tenant_id,
+                log = log,
+                offset = offset,
+                entries_minted = offset + 1,
+            );
+        }
         self.emit_audit("APPEND", tenant_id, log, event_result(&result), ctx)
             .await;
         result
@@ -523,9 +555,36 @@ impl<S: Store> ScrollEngine<S> {
         ctx: &AuditContext,
     ) -> Result<Vec<LogEntry>, ScrollError> {
         let resource = format!("{log}/{group}");
+        let start = std::time::Instant::now();
         let result = self
             .read_group_inner(tenant_id, log, group, reader_id, limit, ctx)
             .await;
+        let latency_us = start.elapsed().as_micros() as u64;
+        if let Ok(ref entries) = result {
+            // SPEC §13: scroll_read_group_latency_seconds (histogram) +
+            // scroll_delivery_count_total{outcome=delivered}.
+            tracing::info!(
+                target: "scroll::metrics",
+                metric = "read_group_latency",
+                tenant = tenant_id,
+                log = log,
+                group = group,
+                reader_id = reader_id,
+                latency_us = latency_us,
+                delivered = entries.len(),
+            );
+            if !entries.is_empty() {
+                tracing::info!(
+                    target: "scroll::metrics",
+                    metric = "delivery",
+                    tenant = tenant_id,
+                    log = log,
+                    group = group,
+                    outcome = "delivered",
+                    count = entries.len(),
+                );
+            }
+        }
         self.emit_audit(
             "READ_GROUP",
             tenant_id,
@@ -691,8 +750,17 @@ impl<S: Store> ScrollEngine<S> {
                         let dlq_bytes = serde_json::to_vec(&dlq_record)
                             .map_err(|e| ScrollError::Internal(format!("dlq encode: {e}")))?;
                         let dk = groups::dlq_key(tenant_id, log, pending.offset);
+                        // Apply DLQ retention TTL so dead-lettered entries don't
+                        // accumulate forever. None = keep forever (§11 config).
+                        let mut dlq_opts = PutOptions::default();
+                        if let Some(ttl_ms) = self.config.dlq_retention_ttl_ms
+                            && ttl_ms > 0
+                        {
+                            dlq_opts =
+                                dlq_opts.with_ttl(std::time::Duration::from_millis(ttl_ms as u64));
+                        }
                         self.store
-                            .put(DLQ_NS, &dk, &dlq_bytes, None)
+                            .put_with_options(DLQ_NS, &dk, &dlq_bytes, dlq_opts)
                             .await
                             .map_err(|e| ScrollError::Store(format!("dlq put: {e}")))?;
                         // Remove from pending. CAS on the pending version so we
@@ -744,6 +812,29 @@ impl<S: Store> ScrollEngine<S> {
                     ctx,
                 )
                 .await;
+            }
+            // SPEC §13: scroll_delivery_count_total{outcome=claimed|dlq}.
+            if !claimed.is_empty() {
+                tracing::info!(
+                    target: "scroll::metrics",
+                    metric = "delivery",
+                    tenant = tenant_id,
+                    log = log,
+                    group = group,
+                    outcome = "claimed",
+                    count = claimed.len(),
+                );
+            }
+            if !dlq_moves.is_empty() {
+                tracing::info!(
+                    target: "scroll::metrics",
+                    metric = "delivery",
+                    tenant = tenant_id,
+                    log = log,
+                    group = group,
+                    outcome = "dlq",
+                    count = dlq_moves.len(),
+                );
             }
             Ok(claimed)
         }
@@ -849,6 +940,31 @@ impl<S: Store> ScrollEngine<S> {
             }
         }
 
+        // SPEC §13 gauges — computed from state already materialized here so
+        // we pay one list (above) instead of a separate metrics scrape.
+        let next_offset = self.current_next_offset(tenant_id, log).await.unwrap_or(0);
+        let lag = if g.last_delivered_offset == u64::MAX {
+            next_offset
+        } else {
+            next_offset.saturating_sub(g.last_delivered_offset.saturating_add(1))
+        };
+        tracing::info!(
+            target: "scroll::metrics",
+            metric = "pending_entries",
+            tenant = tenant_id,
+            log = log,
+            group = group,
+            value = pending_count,
+        );
+        tracing::info!(
+            target: "scroll::metrics",
+            metric = "group_lag_offsets",
+            tenant = tenant_id,
+            log = log,
+            group = group,
+            value = lag,
+        );
+
         Ok(GroupInfo {
             log: log.to_string(),
             group: group.to_string(),
@@ -861,7 +977,8 @@ impl<S: Store> ScrollEngine<S> {
 
     /// TAIL. Live-tail reader: returns at most `limit` entries at or after
     /// `from_offset`, waiting up to `timeout_ms` for new appends if the log
-    /// doesn't already have `limit` entries in range.
+    /// doesn't already have `limit` entries in range. `timeout_ms = None`
+    /// applies the engine's configured `tail_default_timeout_ms`.
     ///
     /// Sentry-gated; no audit (reads are not audited). Requires Cipher (every
     /// entry is decrypted before returning).
@@ -877,13 +994,14 @@ impl<S: Store> ScrollEngine<S> {
         log: &str,
         from_offset: u64,
         limit: u32,
-        timeout_ms: u64,
+        timeout_ms: Option<u64>,
         ctx: &AuditContext,
     ) -> Result<Vec<LogEntry>, ScrollError> {
         self.check_policy(tenant_id, log, "tail", ctx).await?;
         if limit == 0 {
             return Ok(Vec::new());
         }
+        let timeout_ms = timeout_ms.unwrap_or(self.config.tail_default_timeout_ms);
         let (dek, _meta) = self
             .keys
             .get_existing(self.store.as_ref(), self.require_cipher()?, tenant_id, log)
@@ -924,7 +1042,16 @@ impl<S: Store> ScrollEngine<S> {
                 // Timeout reached — return whatever we've accumulated.
                 Err(_) => break,
                 // Subscription closed before we met the limit — treat as overflow.
-                Ok(None) => return Err(ScrollError::TailOverflow),
+                Ok(None) => {
+                    // SPEC §13: scroll_tail_overflow_total{tenant,log}.
+                    tracing::info!(
+                        target: "scroll::metrics",
+                        metric = "tail_overflow",
+                        tenant = tenant_id,
+                        log = log,
+                    );
+                    return Err(ScrollError::TailOverflow);
+                }
             };
             if !event.key.starts_with(&prefix) {
                 continue;
@@ -1880,7 +2007,7 @@ mod tests {
                 .unwrap();
         }
         // All 3 already persisted — TAIL should return without waiting.
-        let got = eng.tail("t", "l", 0, 10, 500, &ctx()).await.unwrap();
+        let got = eng.tail("t", "l", 0, 10, Some(500), &ctx()).await.unwrap();
         assert_eq!(got.len(), 3);
     }
 
@@ -1903,7 +2030,7 @@ mod tests {
         });
 
         // Start tail at offset 1 (after the seed) — expect the 2 upcoming.
-        let got = eng.tail("t", "l", 1, 2, 2_000, &ctx()).await.unwrap();
+        let got = eng.tail("t", "l", 1, 2, Some(2_000), &ctx()).await.unwrap();
         assert_eq!(got.len(), 2);
         assert_eq!(got[0].offset, 1);
         assert_eq!(got[1].offset, 2);
@@ -1916,14 +2043,14 @@ mod tests {
             .await
             .unwrap();
         // Ask for more than exist; no writer publishes; short timeout.
-        let got = eng.tail("t", "l", 0, 10, 50, &ctx()).await.unwrap();
+        let got = eng.tail("t", "l", 0, 10, Some(50), &ctx()).await.unwrap();
         assert_eq!(got.len(), 1);
     }
 
     #[tokio::test]
     async fn tail_zero_limit_returns_empty() {
         let eng = new_engine().await;
-        let got = eng.tail("t", "l", 0, 0, 100, &ctx()).await.unwrap();
+        let got = eng.tail("t", "l", 0, 0, Some(100), &ctx()).await.unwrap();
         assert!(got.is_empty());
     }
 
@@ -1965,6 +2092,44 @@ mod tests {
         // Pending records now owned by r2 with delivery_count=2.
         let info = eng.group_info("t", "l", "g", &ctx()).await.unwrap();
         assert_eq!(info.pending_count, 3);
+    }
+
+    #[tokio::test]
+    async fn dlq_entries_carry_configured_ttl() {
+        // A 50ms DLQ TTL: force one DLQ move, then wait past the TTL and
+        // confirm the DLQ row is gone (Store sweeper evicted it).
+        let store = shroudb_storage::test_util::create_test_store("scroll-dlq-ttl").await;
+        let caps = Capabilities::new().with_cipher(FakeCipher::new());
+        let cfg = EngineConfig {
+            max_delivery_count: 1,
+            dlq_retention_ttl_ms: Some(50),
+            ..EngineConfig::default()
+        };
+        let eng = ScrollEngine::new(store.clone(), caps, cfg).await.unwrap();
+
+        eng.append("t", "l", b"x".to_vec(), BTreeMap::new(), None, &ctx())
+            .await
+            .unwrap();
+        eng.create_group("t", "l", "g", 0, &ctx()).await.unwrap();
+        eng.read_group("t", "l", "g", "r1", 10, &ctx())
+            .await
+            .unwrap();
+        // delivery_count = 1 after READ_GROUP. With max_delivery_count = 1,
+        // the next CLAIM tips it over → DLQ move.
+        eng.claim("t", "l", "g", "r2", 0, &ctx()).await.unwrap();
+
+        let dk = crate::groups::dlq_key("t", "l", 0);
+        // DLQ row is live immediately after the move.
+        assert!(store.get(DLQ_NS, &dk, None).await.is_ok());
+
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+        // After the TTL elapses + a margin, the Store sweeper must have
+        // reaped it. If it hasn't, TTL isn't being applied.
+        let after = store.get(DLQ_NS, &dk, None).await;
+        assert!(
+            matches!(after, Err(shroudb_store::StoreError::NotFound)),
+            "DLQ row should be TTL-evicted, got {after:?}"
+        );
     }
 
     #[tokio::test]

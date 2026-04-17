@@ -254,13 +254,22 @@ Under single-writer topology, only the primary accepts `APPEND`, `CREATE_GROUP`,
 
 ## 13. Metrics
 
-- `scroll_appends_total{tenant,log}`
-- `scroll_entries_stored{tenant,log}` — gauge
-- `scroll_read_group_latency_seconds` — histogram
-- `scroll_delivery_count_total{tenant,log,group,outcome}` — outcome ∈ `delivered|claimed|dlq`
-- `scroll_pending_entries{tenant,log,group}` — gauge
-- `scroll_group_lag_offsets{tenant,log,group}` — latest_offset - group.last_delivered_offset
-- `scroll_tail_overflow_total{tenant,log}`
+ShrouDB's observability surface is `tracing` + OTEL (Prometheus was removed platform-wide). Scroll emits structured `tracing::info!` events under the `scroll::metrics` target — operators filter on that target to route them to a metrics sink, an OTEL collector, or plain file tail.
+
+Each event carries a `metric` field naming the measurement plus dimensional fields matching the labels below. No Prometheus-style counters or histograms are registered; aggregation is the collector's job.
+
+| Event (`metric=`) | Emitted at | Dimensional fields | Shape |
+|---|---|---|---|
+| `appends_total` | After successful APPEND | `tenant`, `log`, `offset`, `entries_minted` | counter signal (per-event) + derived gauge |
+| `read_group_latency` | After READ_GROUP returns | `tenant`, `log`, `group`, `reader_id`, `latency_us`, `delivered` | histogram-ready sample |
+| `delivery` (`outcome=delivered`) | After READ_GROUP hands out a batch | `tenant`, `log`, `group`, `count` | counter signal |
+| `delivery` (`outcome=claimed`) | After CLAIM completes | `tenant`, `log`, `group`, `count` | counter signal |
+| `delivery` (`outcome=dlq`) | After CLAIM moves entries to DLQ | `tenant`, `log`, `group`, `count` | counter signal |
+| `pending_entries` | At GROUP_INFO time | `tenant`, `log`, `group`, `value` | gauge snapshot |
+| `group_lag_offsets` | At GROUP_INFO time | `tenant`, `log`, `group`, `value` | gauge snapshot (`next_offset - last_delivered - 1`) |
+| `tail_overflow` | When TAIL returns `TailOverflow` | `tenant`, `log` | counter signal |
+
+Audit events (`APPEND`, `CREATE_GROUP`, `READ_GROUP`, `ACK`, `DELETE_LOG`, `CLAIM`, `TRIM`, `DLQ_MOVE`) are separately routed to Chronicle via `ChronicleOps::record` when configured — see §10. Metrics and audit serve different consumers and are not conflated.
 
 ---
 

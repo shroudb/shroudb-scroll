@@ -192,19 +192,16 @@ pub async fn dispatch<S: Store>(
             from_offset,
             limit,
             timeout_ms,
-        } => {
-            let t = timeout_ms.unwrap_or(30_000);
-            match engine
-                .tail(&tenant, &log, from_offset, limit, t, &ctx)
-                .await
-            {
-                Ok(entries) => ScrollResponse::entries(entries),
-                Err(e) => {
-                    warn!(log, error = %e, "TAIL failed");
-                    ScrollResponse::error(e.to_string())
-                }
+        } => match engine
+            .tail(&tenant, &log, from_offset, limit, timeout_ms, &ctx)
+            .await
+        {
+            Ok(entries) => ScrollResponse::entries(entries),
+            Err(e) => {
+                warn!(log, error = %e, "TAIL failed");
+                ScrollResponse::error(e.to_string())
             }
-        }
+        },
     }
 }
 
