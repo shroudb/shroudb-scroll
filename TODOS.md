@@ -28,15 +28,9 @@ Files carrying this vocabulary (not actionable debt):
 
 ## Cross-repo follow-ups
 
-- **`shroudb-chronicle-core::Engine::Scroll` migration.** The variant itself
-  is now in `shroudb-chronicle-core` 1.9.0 (added alongside Display /
-  from_str_loose / serde coverage + tests). Scroll's `emit_audit` helper
-  still uses `Engine::Custom("scroll".into())` because the published dep
-  pin is `shroudb-chronicle-core = "1.7.3"` — migration is two mechanical
-  edits (bump dep to `^1.9.0`, swap `Custom("scroll")` → `Scroll`) gated on
-  chronicle-core 1.9.0 being published to the `shroudb` registry. Both
-  representations round-trip to the identical wire string `"scroll"`, so
-  consumers see no behaviour change either way.
+All cross-repo follow-ups are now closed. Scroll builds against the
+published `shroudb-chronicle-core ^1.9.0` and emits audit events via the
+first-class `ChronicleEngine::Scroll` variant (scroll commit `c3955fa`).
 
 - **Moat embedding — done** (shroudb-moat commit `7ba5229`). Scroll is now
   registered behind the `scroll` feature flag alongside the other nine

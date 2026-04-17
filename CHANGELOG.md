@@ -29,12 +29,12 @@ Initial release. Everything listed below is P0 + P1 scope per `SPEC.md` §18.
 - **Q5 — Tenant isolation:** flat `{tenant_id}/{log}/{offset:020}` key layout; apps embed hierarchy in the log name if they want it.
 - **Q6 — Max-entry-size:** hard reject above `max_entry_bytes` with `ScrollError::EntryTooLarge`.
 
-### Known follow-ups (P2, cross-repo)
-- Chronicle `Engine::Scroll` variant bump in `shroudb-chronicle-core` — Scroll currently emits audit events as `Engine::Custom("scroll")`.
-- Open questions Q2 (retention vs. lagging groups), Q3 (CAS fairness), Q4 (DLQ replay), Q7 (reader-group idle GC) remain deferred.
+### Known follow-ups
+- Open questions Q2 (retention vs. lagging groups), Q3 (CAS fairness), Q4 (DLQ replay), Q7 (reader-group idle GC) remain deferred per SPEC §17.
 
 ### Done (P2, cross-repo)
 - **Moat embedding** shipped in shroudb-moat commit `7ba5229`. Scroll runs behind the `moat`-side `scroll` feature flag with prefix-routed command dispatch, embedded Cipher DEK wrapping, and an end-to-end integration test proving the full TCP → router → engine → Cipher path.
+- **Chronicle `Engine::Scroll` variant** shipped in `shroudb-chronicle-core` v1.9.0. Scroll's `emit_audit` helper now uses the typed `ChronicleEngine::Scroll` instead of `Engine::Custom("scroll")`; dep pin bumped to `^1.9.0`.
 
 ### Coverage
 96 tests across 6 crates. `cargo fmt`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo deny check` all pass.
