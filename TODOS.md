@@ -28,8 +28,6 @@ Files carrying this vocabulary (not actionable debt):
 
 ## Cross-repo follow-ups
 
-These require coordinated bumps in other repos and are deliberately deferred:
-
 - **`shroudb-chronicle-core::Engine::Scroll` variant.** Scroll's engine currently
   emits audit events with `Engine::Custom("scroll".into())` because the
   Chronicle core enum doesn't yet include a first-class Scroll variant. Adding
@@ -39,10 +37,11 @@ These require coordinated bumps in other repos and are deliberately deferred:
   blocking for Scroll — `Custom` variants are the supported extension path.
   File: `shroudb-scroll-engine/src/engine.rs` (the `emit_audit` helper).
 
-- **Moat embedding.** `shroudb-moat` doesn't yet register Scroll's
-  engine+protocol for embedded routing. Scroll runs standalone today; Moat
-  integration is the P2 deliverable that unifies it with the other engines
-  behind one port.
+- **Moat embedding — done** (shroudb-moat commit `7ba5229`). Scroll is now
+  registered behind the `scroll` feature flag alongside the other nine
+  engines, with prefix-routed command dispatch (`SCROLL APPEND ...`), an
+  embedded `ScrollCipherOps` adapter over the co-located CipherEngine, and
+  end-to-end integration coverage in `shroudb-moat/tests/integration.rs`.
 
 ## Deferred design questions (SPEC §17)
 
