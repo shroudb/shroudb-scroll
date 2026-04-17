@@ -1,0 +1,30 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  release:
+    uses: shroudb/.github/.github/workflows/rust-release.yml@main
+    permissions:
+      contents: write
+      packages: write
+    with:
+      product: "scroll"
+      server_package: "shroudb-scroll-server"
+      server_binary: "shroudb-scroll"
+      cli_package: "shroudb-scroll-cli"
+      cli_binary: "shroudb-scroll-cli"
+      docker_server_target: "shroudb-scroll"
+      docker_cli_target: "shroudb-scroll-cli"
+      crates: "shroudb-scroll-core,shroudb-scroll-engine,shroudb-scroll-protocol,shroudb-scroll-client,shroudb-scroll-server,shroudb-scroll-cli"
+    secrets:
+      REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+      GH_PAT: ${{ secrets.GH_PAT }}
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
