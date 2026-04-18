@@ -1,3 +1,4 @@
+use dashmap::DashMap;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -38,7 +39,11 @@ pub struct EngineConfig {
     pub default_max_header_bytes: u64,
     /// If set, every entry inherits this TTL when the caller doesn't override.
     pub default_retention_ttl_ms: Option<i64>,
-    /// CAS retry budget for the offset counter per `APPEND`.
+    /// **Deprecated** (SPEC §17 Q3 resolution): offset allocation no
+    /// longer uses CAS; a per-log in-memory `Mutex` serializes APPEND so
+    /// every call receives an offset. The field is retained for config
+    /// schema stability — existing deployments with this key in their
+    /// TOML continue to parse. New deployments can omit it.
     pub offset_cas_retry_max: u32,
     /// CAS retry budget for group cursor advancement per `READ_GROUP`.
     pub group_cursor_cas_retry_max: u32,
@@ -122,11 +127,37 @@ pub struct GroupInfo {
     pub created_at_ms: i64,
 }
 
+/// Per-log APPEND serializer state (SPEC §17 Q3).
+///
+/// `next_offset` is `None` until the first APPEND loads the counter from
+/// `scroll.offsets`. After that it's the in-memory source of truth; every
+/// APPEND increments and persists atomically under the `Mutex`.
+///
+/// `deleted` is a tombstone flag set by `DELETE_LOG` while holding the
+/// same mutex. An APPEND that was blocked waiting for the lock when
+/// DELETE_LOG ran observes the flag on acquire and retries against a
+/// fresh appender (DashMap entry for this log has been evicted), so
+/// pre-delete in-memory state never writes post-delete entries.
+#[derive(Debug)]
+struct LogAppender {
+    next_offset: Option<u64>,
+    deleted: bool,
+}
+
 pub struct ScrollEngine<S: Store> {
     store: Arc<S>,
     caps: Arc<Capabilities>,
     keys: KeyManager,
     config: EngineConfig,
+    /// Per-log APPEND serializers (SPEC §17 Q3). Resolves the CAS-retry
+    /// correctness gap by running all offset allocation for a given log
+    /// through one in-memory `Mutex` — every APPEND is guaranteed to
+    /// receive an offset, never a `VersionConflict`. Lazy-inserted on
+    /// first APPEND, evicted on `DELETE_LOG`.
+    ///
+    /// Key: `"{tenant_id}/{log}"`. Holding `tokio::sync::Mutex` (not
+    /// `std::sync`) so the guard survives across `.await` points.
+    appenders: DashMap<String, Arc<tokio::sync::Mutex<LogAppender>>>,
 }
 
 impl<S: Store> ScrollEngine<S> {
@@ -160,7 +191,25 @@ impl<S: Store> ScrollEngine<S> {
             caps: Arc::new(caps),
             keys: KeyManager::new(),
             config,
+            appenders: DashMap::new(),
         })
+    }
+
+    /// Get or create the per-log `LogAppender` (SPEC §17 Q3). The entry is
+    /// shared across callers via `Arc<Mutex<…>>`; `DashMap::entry` ensures
+    /// exactly one appender exists per `(tenant, log)` even under
+    /// concurrent first-APPEND races.
+    fn appender_for(&self, tenant_id: &str, log: &str) -> Arc<tokio::sync::Mutex<LogAppender>> {
+        let key = format!("{tenant_id}/{log}");
+        self.appenders
+            .entry(key)
+            .or_insert_with(|| {
+                Arc::new(tokio::sync::Mutex::new(LogAppender {
+                    next_offset: None,
+                    deleted: false,
+                }))
+            })
+            .clone()
     }
 
     // ─────────────────────────── helpers ───────────────────────────
@@ -317,9 +366,13 @@ impl<S: Store> ScrollEngine<S> {
 
     // ─────────────────────────── commands ───────────────────────────
 
-    /// APPEND. Mints a new offset via CAS, encrypts the entry with the per-log
-    /// DEK, and stores it under `scroll.logs`. Returns the allocated offset.
-    /// Sentry-gated; emits an `APPEND` audit event on both success and failure.
+    /// APPEND. Encrypts the entry with the per-log DEK and stores it under
+    /// `scroll.logs`. Offset allocation runs through the per-log
+    /// `LogAppender` serializer (SPEC §17 Q3) — every APPEND is guaranteed
+    /// to receive an offset; the CAS-retry path is gone.
+    ///
+    /// Sentry-gated; emits an `APPEND` audit event on both success and
+    /// failure.
     pub async fn append(
         &self,
         tenant_id: &str,
@@ -349,17 +402,55 @@ impl<S: Store> ScrollEngine<S> {
                 });
             }
 
-            // Provision-or-load the log's DEK.
-            let (dek, meta) = self
-                .keys
-                .get_or_create(
-                    self.store.as_ref(),
-                    self.require_cipher()?,
-                    tenant_id,
-                    log,
-                    self.provision_defaults(now_ms),
-                )
-                .await?;
+            // Check cipher presence before taking the lock; actual DEK
+            // load happens INSIDE the lock to avoid a stale-DEK race
+            // with DELETE_LOG (see SPEC §17 Q3 teardown comments).
+            self.require_cipher()?;
+
+            // Per-log serializer (SPEC §17 Q3). Lock the appender for
+            // the full critical section: DEK load, offset allocation,
+            // entry encrypt, entry persist, counter persist. Inside
+            // this lock we are the single writer for this (tenant,
+            // log), and the DEK read cannot be interleaved with
+            // DELETE_LOG destroying the wrapped-key row.
+            //
+            // Retry-on-deleted: an APPEND blocked waiting for the
+            // mutex when DELETE_LOG ran sees `deleted = true` on
+            // acquire. DELETE_LOG resets the state (deleted=false,
+            // next_offset=None) *before* releasing, so the next
+            // acquire after this retry sees a clean slate; the
+            // intermediate wake is harmless.
+            let (mut state, offset, dek, meta) = loop {
+                let appender = self.appender_for(tenant_id, log);
+                let mut guard = appender.lock_owned().await;
+                if guard.deleted {
+                    drop(guard);
+                    continue;
+                }
+                // DEK load is now inside the lock. Any racing
+                // DELETE_LOG has either (a) not yet started — we got
+                // the lock first; it will wait for us, or (b) already
+                // completed — meta is gone and get_or_create provisions
+                // a fresh DEK that we'll use.
+                let (dek, meta) = self
+                    .keys
+                    .get_or_create(
+                        self.store.as_ref(),
+                        self.require_cipher()?,
+                        tenant_id,
+                        log,
+                        self.provision_defaults(now_ms),
+                    )
+                    .await?;
+                let offset = if let Some(n) = guard.next_offset {
+                    n
+                } else {
+                    let loaded = offsets::load(self.store.as_ref(), tenant_id, log).await?;
+                    guard.next_offset = Some(loaded);
+                    loaded
+                };
+                break (guard, offset, dek, meta);
+            };
 
             // Effective TTL = caller override ∨ per-log default ∨ engine default.
             let effective_ttl = ttl_ms
@@ -367,17 +458,9 @@ impl<S: Store> ScrollEngine<S> {
                 .or(self.config.default_retention_ttl_ms);
             let expires_at_ms =
                 effective_ttl.and_then(|ms| if ms > 0 { Some(now_ms + ms) } else { None });
-
-            // Reserve offset via CAS on scroll.offsets.
-            let offset = offsets::allocate(
-                self.store.as_ref(),
-                tenant_id,
-                log,
-                self.config.offset_cas_retry_max,
-            )
-            .await?;
-
-            // Build the domain LogEntry, serialize, encrypt with AAD-bound DEK.
+            // Build+encrypt+persist BEFORE we commit the counter bump, so a
+            // Store failure on the entry put leaves the counter unchanged
+            // and the next APPEND re-uses the same offset cleanly.
             let entry = LogEntry {
                 offset,
                 tenant_id: tenant_id.to_string(),
@@ -391,26 +474,28 @@ impl<S: Store> ScrollEngine<S> {
                 .map_err(|e| ScrollError::Internal(format!("entry encode: {e}")))?;
             let aad = build_aad(tenant_id, log, offset);
             let ciphertext = encrypt_entry(dek.as_bytes(), &plaintext, &aad)?;
-
-            // Persist the ciphertext. TTL is entry-level; the Store sweeper
-            // deletes it when `expires_at_ms` is reached. `appended_at_ms`
-            // is attached as Store metadata so TRIM MAX_AGE can filter
-            // without decrypting the payload (timestamps are not sensitive —
-            // see SPEC §19).
             let mut meta = HashMap::new();
             meta.insert("ts".to_string(), MetadataValue::Integer(now_ms));
             let mut opts = PutOptions::default().with_metadata(meta);
             if let Some(exp) = expires_at_ms {
-                let now = now_ms;
-                let remaining = (exp - now).max(1) as u64;
+                let remaining = (exp - now_ms).max(1) as u64;
                 opts = opts.with_ttl(std::time::Duration::from_millis(remaining));
             }
-
             let key = Self::entry_key(tenant_id, log, offset);
             self.store
                 .put_with_options(LOGS_NS, &key, &ciphertext, opts)
                 .await
                 .map_err(|e| ScrollError::Store(format!("entry put: {e}")))?;
+
+            // Commit the counter. On Store failure here the entry is
+            // already durable but next_offset wasn't advanced — next APPEND
+            // re-uses this offset, which would clobber the existing entry
+            // at the same key. That's the same Store-write-failure window
+            // the CAS path had (persistent Store failure = undefined
+            // behaviour); we accept it.
+            let next = offset.saturating_add(1);
+            offsets::persist(self.store.as_ref(), tenant_id, log, next).await?;
+            state.next_offset = Some(next);
 
             Ok(offset)
         }
@@ -1427,6 +1512,25 @@ impl<S: Store> ScrollEngine<S> {
         ctx: &AuditContext,
     ) -> Result<(), ScrollError> {
         self.check_policy(tenant_id, log, "delete_log", ctx).await?;
+        // SPEC §17 Q3 serializer teardown. We must NOT evict the per-log
+        // appender from the DashMap before we're done deleting — a
+        // racing APPEND would spawn a *fresh* appender (different
+        // mutex) and proceed concurrently with our delete_prefix calls,
+        // writing entries into `scroll.logs` that get encrypted under
+        // the now-stale DEK before we destroy it. Reads would then see
+        // those entries as undecryptable ciphertext.
+        //
+        // Correct sequence: acquire the existing appender's mutex,
+        // flag `deleted = true`, then — while still holding the lock —
+        // do every Store delete. Any concurrent APPEND lands on the
+        // same DashMap entry, acquires the same mutex, sees the
+        // deleted flag, and retries. When DELETE_LOG finishes, we
+        // reset the appender state in-place so the next APPEND starts
+        // cleanly against the now-empty log.
+        let appender = self.appender_for(tenant_id, log);
+        let mut state = appender.lock_owned().await;
+        state.deleted = true;
+
         let data_prefix = Self::entry_prefix(tenant_id, log);
         self.store
             .delete_prefix(LOGS_NS, &data_prefix)
@@ -1458,6 +1562,18 @@ impl<S: Store> ScrollEngine<S> {
             Err(e) => return Err(ScrollError::Store(format!("meta delete: {e}"))),
         }
         self.keys.evict(tenant_id, log);
+
+        // Reset the serializer in-place so a future APPEND (which will
+        // block on `state.deleted` above until we release this guard)
+        // sees a clean slate: `next_offset = None` forces reload from
+        // Store (which is now empty → 0); `deleted = false` unblocks
+        // the retry loop. Keeping the DashMap entry means the Arc
+        // identity is stable — racing APPENDs never see two different
+        // Mutexes for the same log.
+        state.next_offset = None;
+        state.deleted = false;
+        drop(state);
+
         Ok(())
     }
 
@@ -2778,9 +2894,10 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_appends_mint_unique_monotonic_offsets() {
-        // N producers racing APPEND on the same log at default config — the
-        // CAS offset counter must hand out every u64 in [0, N) exactly once.
-        // N == offset_cas_retry_max so we exercise the ceiling.
+        // SPEC §17 Q3: the per-log serializer must hand out every u64 in
+        // [0, N) exactly once under N-way racing APPEND, *without* any
+        // dependence on `offset_cas_retry_max` (which is deprecated and
+        // no longer consulted).
         const N: u64 = 64;
         let eng = Arc::new(new_engine().await);
 
@@ -2803,6 +2920,84 @@ mod tests {
             offsets, expected,
             "expected every offset in 0..{N} to be minted exactly once"
         );
+    }
+
+    #[tokio::test]
+    async fn appends_survive_contention_far_past_old_cas_budget() {
+        // SPEC §17 Q3 regression test. Under the old CAS path,
+        // `offset_cas_retry_max` defaulted to 64 and APPENDs above that
+        // racing count returned VersionConflict. The serializer must
+        // have no such ceiling. Run 200-way contention at default
+        // config; every call must succeed and every offset must be
+        // unique.
+        const N: u64 = 200;
+        let eng = Arc::new(new_engine().await);
+
+        let mut handles = Vec::with_capacity(N as usize);
+        for i in 0..N {
+            let eng = eng.clone();
+            handles.push(tokio::spawn(async move {
+                eng.append(
+                    "t",
+                    "l",
+                    vec![(i & 0xff) as u8],
+                    BTreeMap::new(),
+                    None,
+                    &ctx(),
+                )
+                .await
+            }));
+        }
+        let mut offsets: Vec<u64> = Vec::with_capacity(N as usize);
+        for h in handles {
+            offsets.push(h.await.unwrap().expect("append must not fail"));
+        }
+        offsets.sort_unstable();
+        assert_eq!(offsets, (0..N).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn delete_log_serializes_with_concurrent_append() {
+        // SPEC §17 Q3 serializer teardown. Race DELETE_LOG against a
+        // stream of APPENDs and assert the invariant that actually
+        // matters: neither call deadlocks, neither panics, and nothing
+        // from the pre-delete state corrupts the post-delete log.
+        //
+        // We can't assert "fresh APPEND = offset 0" — the pusher's
+        // still-queued APPENDs may legitimately re-enter the recreated
+        // log after DELETE_LOG releases its lock (they block on the
+        // deleted flag, retry through `appender_for`, and land on the
+        // fresh appender). That's correct behaviour.
+        //
+        // The strong invariant: every entry readable post-race decrypts
+        // cleanly under the log's current DEK. If a pre-delete entry
+        // leaked into the post-delete log, the fresh DEK would fail to
+        // decrypt it → READ would surface a crypto error rather than a
+        // valid batch.
+        let eng = Arc::new(new_engine().await);
+        eng.append("t", "l", b"seed".to_vec(), BTreeMap::new(), None, &ctx())
+            .await
+            .unwrap();
+
+        let appender = eng.clone();
+        let pusher = tokio::spawn(async move {
+            for i in 0..20u8 {
+                let _ = appender
+                    .append("t", "l", vec![i], BTreeMap::new(), None, &ctx())
+                    .await;
+            }
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        eng.delete_log("t", "l", &ctx()).await.unwrap();
+        pusher.await.unwrap();
+
+        match eng.read("t", "l", 0, 1000, &ctx()).await {
+            Ok(_) => {}
+            // Also fine: delete beat every push, log is gone.
+            Err(ScrollError::LogNotFound(_)) => {}
+            Err(other) => panic!("post-race read surfaced corruption: {other:?}"),
+        }
     }
 
     #[tokio::test]

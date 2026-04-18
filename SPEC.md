@@ -313,14 +313,14 @@ Called out so they're not silently decided during implementation.
 
 **Resolved (v0.1):**
 1. **Payload encryption scope** → **per-log Cipher envelope, fail-closed when Cipher absent.** Each log owns a DEK wrapped in `scroll.meta`; `DELETE_LOG` destroys the wrapped DEK to crypto-shred the log. Cipher is optional at engine construction (Sigil pattern); `APPEND`, `READ`, and `READ_GROUP` reject with `CapabilityMissing("cipher")` when absent rather than falling back to plaintext. See §4 for the envelope layout and AAD binding; §10 for the full capability table.
+2. **Retention vs lagging groups** → **hybrid: unconditional trim with `min_retention_behind_slowest_group` guardrail.** `TRIM_MAX_LEN` / `TRIM_MAX_AGE` and TTL reap entries unconditionally, but before deleting, the engine computes the slowest group cursor for the log and refuses to trim past `slowest_cursor - min_retention_behind_slowest_group` offsets. Default guardrail is 0 (Kafka-style unconditional) so it's opt-in. See §8 for the guardrail semantics.
+3. **Ordering across append contention** → **per-log `tokio::sync::Mutex` serializer replaces CAS on `scroll.offsets`.** Each `(tenant_id, log)` gets a cached `Arc<Mutex<LogAppender>>` in a `DashMap`; `APPEND` acquires it, loads-or-uses-cached `next_offset`, writes the entry + advances the counter, then releases. FIFO fairness within a log without global locking, no retry loops under contention, and DEK load + offset bump + log write stay atomic under a single lock — required so `DELETE_LOG` cannot race an in-flight encrypt with the old DEK. Cross-log contention is still lock-free; the serializer is per-log. See §11.
+4. **DLQ replay** → **explicit `REPLAY <log> <group> <offset>` command.** Reads the DLQ record at the offset, re-inserts a `PendingEntry` into `scroll.pending` with the original `reader_id` and fresh `delivered_at_ms`, and deletes the DLQ record (put-first, delete-second). Returns `DlqEntryNotFound` if the offset has no DLQ record for the log. DLQ is not terminal — operators can replay selectively without draining out-of-band.
 5. **Tenant isolation scope** → **flat** `{tenant_id}/{log}/{offset:020}`. Apps needing sub-scoping embed it in the log name.
 6. **Max-entry-size semantics** → **hard reject** above `max_entry_bytes` (`ScrollError::EntryTooLarge`). Fail-closed.
+7. **Reader-group lifecycle** → **explicit `DELETE_GROUP <log> <group>` command; no TTL-based auto-delete.** Deletes the `scroll.groups` entry and all `scroll.pending` entries for the group (prefix delete). Auto-expiry on inactivity is deferred — absent activity telemetry it's guesswork, and stale-but-visible groups are safer than silently dropping pending work.
 
-**Open:**
-2. **Retention vs lagging groups.** Should retention be gated by the slowest group cursor (retain until all groups have advanced past) or unconditional? Unconditional is simpler and matches Kafka; group-gated prevents data loss but risks unbounded retention. Proposed: unconditional with a `min_retention_behind_slowest_group` guardrail config.
-3. **Ordering across append contention.** With CAS on `scroll.offsets`, contending appends see retries. Under pathological load, fairness across tenants/logs could starve a contender. Is FIFO fairness needed, or is CAS-retry acceptable?
-4. **DLQ replay.** Manual replay command (`REPLAY <log> <group> <offset>` that re-inserts into `scroll.pending`)? Or DLQ is terminal and operators drain out-of-band?
-7. **Reader group TTL on inactivity.** If a group has no `READ_GROUP` activity for N days, auto-delete? Same question for pending entries of readers that never return.
+**Open:** none. All v0.1 open questions resolved.
 
 ---
 
