@@ -30,7 +30,7 @@ pub enum TrimBy {
     MaxAgeMs(i64),
 }
 
-/// Engine-level configuration. Defaults match the `[scroll]` section of SPEC §11.
+/// Engine-level configuration.
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
     /// Hard upper bound for `APPEND` body size (payload + serialized headers).
@@ -39,11 +39,11 @@ pub struct EngineConfig {
     pub default_max_header_bytes: u64,
     /// If set, every entry inherits this TTL when the caller doesn't override.
     pub default_retention_ttl_ms: Option<i64>,
-    /// **Deprecated** (SPEC §17 Q3 resolution): offset allocation no
-    /// longer uses CAS; a per-log in-memory `Mutex` serializes APPEND so
-    /// every call receives an offset. The field is retained for config
-    /// schema stability — existing deployments with this key in their
-    /// TOML continue to parse. New deployments can omit it.
+    /// **Deprecated.** Offset allocation no longer uses CAS; a per-log
+    /// in-memory `Mutex` serializes APPEND so every call receives an
+    /// offset. The field is retained for config schema stability —
+    /// existing deployments with this key in their TOML continue to
+    /// parse. New deployments can omit it.
     pub offset_cas_retry_max: u32,
     /// CAS retry budget for group cursor advancement per `READ_GROUP`.
     pub group_cursor_cas_retry_max: u32,
@@ -53,7 +53,7 @@ pub struct EngineConfig {
     /// Default `min_idle_ms` recommended to `CLAIM` callers; also used as the
     /// idle threshold below which a reader is considered "fresh" in
     /// `GROUP_INFO` member listings. Operators tune this to their reader
-    /// polling cadence (SPEC §11 `reader_idle_threshold_ms`).
+    /// polling cadence.
     pub reader_idle_threshold_ms: i64,
     /// Default `TAIL` wait budget when the caller omits `TIMEOUT`.
     pub tail_default_timeout_ms: u64,
@@ -62,11 +62,11 @@ pub struct EngineConfig {
     /// closes and the call returns `TailOverflow`.
     pub tail_subscribe_buffer: usize,
     /// TTL applied to `scroll.dlq` entries at write time. `None` means DLQ
-    /// entries live forever (operators must drain out-of-band). SPEC §11
-    /// default: 30 days.
+    /// entries live forever (operators must drain out-of-band). Default:
+    /// 30 days.
     pub dlq_retention_ttl_ms: Option<i64>,
-    /// Retention guardrail (SPEC §17 Q2): `TRIM` refuses to delete any entry
-    /// whose offset is within `min_retention_behind_slowest_group` of the
+    /// Retention guardrail: `TRIM` refuses to delete any entry whose
+    /// offset is within `min_retention_behind_slowest_group` of the
     /// slowest active reader group's cursor.
     ///
     /// - `0` (default): Kafka semantics — TRIM trims unconditionally.
@@ -85,12 +85,9 @@ impl Default for EngineConfig {
             default_max_entry_bytes: 1_048_576,
             default_max_header_bytes: 16_384,
             default_retention_ttl_ms: None,
-            // Offsets see much higher contention than group cursors:
-            // every APPEND on a given log races on `scroll.offsets`, whereas
-            // `scroll.groups` only sees readers-per-group contention. With
-            // N-way racing appenders, worst-case retries scale O(N), so 64
-            // buys headroom for bursty producers. Tune up for pathological
-            // contention (see SPEC §17 Q3 on fairness).
+            // Retained for backwards-compatible config parsing only; the
+            // per-log APPEND serializer replaces CAS on `scroll.offsets`,
+            // so this value has no runtime effect.
             offset_cas_retry_max: 64,
             group_cursor_cas_retry_max: 8,
             max_delivery_count: 16,
@@ -127,7 +124,7 @@ pub struct GroupInfo {
     pub created_at_ms: i64,
 }
 
-/// Per-log APPEND serializer state (SPEC §17 Q3).
+/// Per-log APPEND serializer state.
 ///
 /// `next_offset` is `None` until the first APPEND loads the counter from
 /// `scroll.offsets`. After that it's the in-memory source of truth; every
@@ -149,10 +146,9 @@ pub struct ScrollEngine<S: Store> {
     caps: Arc<Capabilities>,
     keys: KeyManager,
     config: EngineConfig,
-    /// Per-log APPEND serializers (SPEC §17 Q3). Resolves the CAS-retry
-    /// correctness gap by running all offset allocation for a given log
-    /// through one in-memory `Mutex` — every APPEND is guaranteed to
-    /// receive an offset, never a `VersionConflict`. Lazy-inserted on
+    /// Per-log APPEND serializers. All offset allocation for a given log
+    /// runs through one in-memory `Mutex` — every APPEND is guaranteed
+    /// to receive an offset, never a `VersionConflict`. Lazy-inserted on
     /// first APPEND, evicted on `DELETE_LOG`.
     ///
     /// Key: `"{tenant_id}/{log}"`. Holding `tokio::sync::Mutex` (not
@@ -195,8 +191,8 @@ impl<S: Store> ScrollEngine<S> {
         })
     }
 
-    /// Get or create the per-log `LogAppender` (SPEC §17 Q3). The entry is
-    /// shared across callers via `Arc<Mutex<…>>`; `DashMap::entry` ensures
+    /// Get or create the per-log `LogAppender`. The entry is shared
+    /// across callers via `Arc<Mutex<…>>`; `DashMap::entry` ensures
     /// exactly one appender exists per `(tenant, log)` even under
     /// concurrent first-APPEND races.
     fn appender_for(&self, tenant_id: &str, log: &str) -> Arc<tokio::sync::Mutex<LogAppender>> {
@@ -368,8 +364,8 @@ impl<S: Store> ScrollEngine<S> {
 
     /// APPEND. Encrypts the entry with the per-log DEK and stores it under
     /// `scroll.logs`. Offset allocation runs through the per-log
-    /// `LogAppender` serializer (SPEC §17 Q3) — every APPEND is guaranteed
-    /// to receive an offset; the CAS-retry path is gone.
+    /// `LogAppender` serializer — every APPEND is guaranteed to receive
+    /// an offset; there is no CAS-retry path.
     ///
     /// Sentry-gated; emits an `APPEND` audit event on both success and
     /// failure.
@@ -404,11 +400,11 @@ impl<S: Store> ScrollEngine<S> {
 
             // Check cipher presence before taking the lock; actual DEK
             // load happens INSIDE the lock to avoid a stale-DEK race
-            // with DELETE_LOG (see SPEC §17 Q3 teardown comments).
+            // with DELETE_LOG (see teardown comments in `delete_log_inner`).
             self.require_cipher()?;
 
-            // Per-log serializer (SPEC §17 Q3). Lock the appender for
-            // the full critical section: DEK load, offset allocation,
+            // Per-log serializer. Lock the appender for the full
+            // critical section: DEK load, offset allocation,
             // entry encrypt, entry persist, counter persist. Inside
             // this lock we are the single writer for this (tenant,
             // log), and the DEK read cannot be interleaved with
@@ -501,9 +497,9 @@ impl<S: Store> ScrollEngine<S> {
         }
         .await;
         if let Ok(offset) = result {
-            // SPEC §13: scroll_appends_total{tenant,log}. `entries_minted` is
-            // `offset + 1` (monotonic), exposing the `scroll_entries_stored`
-            // gauge signal without a second Store round-trip.
+            // `entries_minted` is `offset + 1` (monotonic), exposing the
+            // `scroll_entries_stored` gauge signal without a second
+            // Store round-trip.
             tracing::info!(
                 target: "scroll::metrics",
                 metric = "appends_total",
@@ -665,8 +661,8 @@ impl<S: Store> ScrollEngine<S> {
             .await;
         let latency_us = start.elapsed().as_micros() as u64;
         if let Ok(ref entries) = result {
-            // SPEC §13: scroll_read_group_latency_seconds (histogram) +
-            // scroll_delivery_count_total{outcome=delivered}.
+            // Emits read_group_latency (histogram) +
+            // delivery_count_total{outcome=delivered}.
             tracing::info!(
                 target: "scroll::metrics",
                 metric = "read_group_latency",
@@ -855,7 +851,7 @@ impl<S: Store> ScrollEngine<S> {
                             .map_err(|e| ScrollError::Internal(format!("dlq encode: {e}")))?;
                         let dk = groups::dlq_key(tenant_id, log, pending.offset);
                         // Apply DLQ retention TTL so dead-lettered entries don't
-                        // accumulate forever. None = keep forever (§11 config).
+                        // accumulate forever. None = keep forever.
                         let mut dlq_opts = PutOptions::default();
                         if let Some(ttl_ms) = self.config.dlq_retention_ttl_ms
                             && ttl_ms > 0
@@ -906,7 +902,7 @@ impl<S: Store> ScrollEngine<S> {
                     None => break,
                 }
             }
-            // Emit one audit event per DLQ move (per SPEC §10).
+            // One audit event per DLQ move.
             for offset in &dlq_moves {
                 self.emit_audit(
                     "DLQ_MOVE",
@@ -917,7 +913,7 @@ impl<S: Store> ScrollEngine<S> {
                 )
                 .await;
             }
-            // SPEC §13: scroll_delivery_count_total{outcome=claimed|dlq}.
+            // Emits delivery_count_total{outcome=claimed|dlq}.
             if !claimed.is_empty() {
                 tracing::info!(
                     target: "scroll::metrics",
@@ -948,8 +944,8 @@ impl<S: Store> ScrollEngine<S> {
         result
     }
 
-    /// REPLAY. Resolves SPEC §17 Q4. Moves a DLQ entry back into a group's
-    /// pending set so the next `READ_GROUP` / `CLAIM` picks it up. The
+    /// REPLAY. Moves a DLQ entry back into a group's pending set so the
+    /// next `READ_GROUP` / `CLAIM` picks it up. The
     /// replay preserves the offset and the `reader_id` recorded in the
     /// DLQ record, resets `delivery_count` to 1, and stamps a fresh
     /// `delivered_at_ms` so timeouts run from now.
@@ -1016,8 +1012,8 @@ impl<S: Store> ScrollEngine<S> {
         result
     }
 
-    /// DELETE_GROUP. Resolves SPEC §17 Q7. Explicitly tears down a single
-    /// reader group: `delete_prefix` every pending record, then delete the
+    /// DELETE_GROUP. Explicitly tears down a single reader group:
+    /// `delete_prefix` every pending record, then delete the
     /// group row. Sentry-gated; audited on both success and failure. Returns
     /// `GroupNotFound` when the group doesn't exist — no silent no-op.
     ///
@@ -1159,8 +1155,8 @@ impl<S: Store> ScrollEngine<S> {
             }
         }
 
-        // SPEC §13 gauges — computed from state already materialized here so
-        // we pay one list (above) instead of a separate metrics scrape.
+        // Gauges — computed from state already materialized here so we
+        // pay one list (above) instead of a separate metrics scrape.
         let next_offset = self.current_next_offset(tenant_id, log).await.unwrap_or(0);
         let lag = if g.last_delivered_offset == u64::MAX {
             next_offset
@@ -1262,7 +1258,7 @@ impl<S: Store> ScrollEngine<S> {
                 Err(_) => break,
                 // Subscription closed before we met the limit — treat as overflow.
                 Ok(None) => {
-                    // SPEC §13: scroll_tail_overflow_total{tenant,log}.
+                    // Emits tail_overflow_total{tenant,log}.
                     tracing::info!(
                         target: "scroll::metrics",
                         metric = "tail_overflow",
@@ -1418,8 +1414,8 @@ impl<S: Store> ScrollEngine<S> {
         Ok(deleted)
     }
 
-    /// Cap a candidate deletion `threshold` by the SPEC §17 Q2 retention
-    /// guardrail: no offset at or above
+    /// Cap a candidate deletion `threshold` by the retention guardrail:
+    /// no offset at or above
     /// `slowest_group_cursor - min_retention_behind_slowest_group` is
     /// deleted. Returns the effective threshold (≤ input).
     ///
@@ -1512,8 +1508,8 @@ impl<S: Store> ScrollEngine<S> {
         ctx: &AuditContext,
     ) -> Result<(), ScrollError> {
         self.check_policy(tenant_id, log, "delete_log", ctx).await?;
-        // SPEC §17 Q3 serializer teardown. We must NOT evict the per-log
-        // appender from the DashMap before we're done deleting — a
+        // Serializer teardown. We must NOT evict the per-log appender
+        // from the DashMap before we're done deleting — a
         // racing APPEND would spawn a *fresh* appender (different
         // mutex) and proceed concurrently with our delete_prefix calls,
         // writing entries into `scroll.logs` that get encrypted under
@@ -2571,7 +2567,7 @@ mod tests {
         assert_eq!(next, 5);
     }
 
-    // ── REPLAY (SPEC §17 Q4) ────────────────────────────────────────────
+    // ── REPLAY ──────────────────────────────────────────────────────────
 
     /// Helper: drive `claim_moves_to_dlq_on_delivery_breach`'s DLQ setup
     /// so the replay tests can operate on a known DLQ state.
@@ -2684,7 +2680,7 @@ mod tests {
         assert!(pending.delivered_at_ms > 0);
     }
 
-    // ── DELETE_GROUP (SPEC §17 Q7) ──────────────────────────────────────
+    // ── DELETE_GROUP ────────────────────────────────────────────────────
 
     #[tokio::test]
     async fn delete_group_removes_pending_and_group_row() {
@@ -2769,7 +2765,7 @@ mod tests {
         assert_eq!(got.len(), 3);
     }
 
-    // ── Retention guardrail (SPEC §17 Q2) ───────────────────────────────
+    // ── Retention guardrail ─────────────────────────────────────────────
 
     #[tokio::test]
     async fn trim_respects_slowest_group_guardrail_max_len() {
@@ -2890,14 +2886,14 @@ mod tests {
         assert_eq!(remaining.len(), 5);
     }
 
-    // ── Concurrency (SPEC §14) ──────────────────────────────────────────
+    // ── Concurrency ─────────────────────────────────────────────────────
 
     #[tokio::test]
     async fn concurrent_appends_mint_unique_monotonic_offsets() {
-        // SPEC §17 Q3: the per-log serializer must hand out every u64 in
-        // [0, N) exactly once under N-way racing APPEND, *without* any
-        // dependence on `offset_cas_retry_max` (which is deprecated and
-        // no longer consulted).
+        // The per-log serializer must hand out every u64 in [0, N)
+        // exactly once under N-way racing APPEND, *without* any
+        // dependence on `offset_cas_retry_max` (which is deprecated
+        // and no longer consulted).
         const N: u64 = 64;
         let eng = Arc::new(new_engine().await);
 
@@ -2924,7 +2920,7 @@ mod tests {
 
     #[tokio::test]
     async fn appends_survive_contention_far_past_old_cas_budget() {
-        // SPEC §17 Q3 regression test. Under the old CAS path,
+        // Regression test. Under the old CAS path,
         // `offset_cas_retry_max` defaulted to 64 and APPENDs above that
         // racing count returned VersionConflict. The serializer must
         // have no such ceiling. Run 200-way contention at default
@@ -2958,8 +2954,8 @@ mod tests {
 
     #[tokio::test]
     async fn delete_log_serializes_with_concurrent_append() {
-        // SPEC §17 Q3 serializer teardown. Race DELETE_LOG against a
-        // stream of APPENDs and assert the invariant that actually
+        // Serializer teardown. Race DELETE_LOG against a stream of
+        // APPENDs and assert the invariant that actually
         // matters: neither call deadlocks, neither panics, and nothing
         // from the pre-delete state corrupts the post-delete log.
         //
@@ -3004,7 +3000,7 @@ mod tests {
     async fn concurrent_read_groups_deliver_each_offset_once() {
         // M readers race READ_GROUP on the same group. Every offset must be
         // delivered to exactly one reader (no duplicate delivery without
-        // CLAIM). Matches the SPEC §7 exclusivity guarantee.
+        // CLAIM) — the reader-group exclusivity guarantee.
         const ENTRIES: u64 = 40;
         const READERS: usize = 5;
         let eng = Arc::new(new_engine().await);

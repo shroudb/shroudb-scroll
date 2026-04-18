@@ -88,7 +88,7 @@ pub struct EngineConfig {
     pub tail_subscribe_buffer: usize,
     #[serde(default = "default_dlq_ttl_ms")]
     pub dlq_retention_ttl_ms: Option<i64>,
-    /// SPEC §17 Q2 retention guardrail. `0` = Kafka semantics (default);
+    /// Retention guardrail. `0` = Kafka semantics (default);
     /// `N > 0` = refuse TRIM within N offsets of slowest group's cursor.
     #[serde(default)]
     pub min_retention_behind_slowest_group: u64,

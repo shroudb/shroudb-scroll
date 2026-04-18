@@ -23,7 +23,7 @@ pub enum ScrollError {
     #[error("dlq entry not found: {log}/{offset}")]
     DlqEntryNotFound { log: String, offset: u64 },
 
-    /// Requested offset range has been retained-away (SPEC §8).
+    /// Requested offset range has been retained-away.
     #[error("range compacted: earliest available offset is {earliest}")]
     CompactedRange { earliest: u64 },
 
@@ -31,7 +31,7 @@ pub enum ScrollError {
     #[error("version conflict: exhausted retry budget on {target}")]
     VersionConflict { target: String },
 
-    /// Live-tail consumer fell behind its channel buffer (SPEC §9).
+    /// Live-tail consumer fell behind its channel buffer.
     #[error("tail overflow")]
     TailOverflow,
 

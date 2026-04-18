@@ -92,8 +92,8 @@ pub enum ScrollCommand {
 }
 
 impl ScrollCommand {
-    /// ACL requirement per SPEC §5. `scroll.<log>` resource namespace, read or
-    /// write scope. Meta commands require no ACL.
+    /// ACL requirement. `scroll.<log>` resource namespace, read or write
+    /// scope. Meta commands require no ACL.
     pub fn acl_requirement(&self) -> AclRequirement {
         let (log, scope) = match self {
             Self::Append { log, .. }
