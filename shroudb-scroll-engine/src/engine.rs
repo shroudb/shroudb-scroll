@@ -863,6 +863,121 @@ impl<S: Store> ScrollEngine<S> {
         result
     }
 
+    /// REPLAY. Resolves SPEC §17 Q4. Moves a DLQ entry back into a group's
+    /// pending set so the next `READ_GROUP` / `CLAIM` picks it up. The
+    /// replay preserves the offset and the `reader_id` recorded in the
+    /// DLQ record, resets `delivery_count` to 1, and stamps a fresh
+    /// `delivered_at_ms` so timeouts run from now.
+    ///
+    /// Sentry-gated; emits a `REPLAY` audit event on both success and
+    /// failure. Returns `DlqEntryNotFound` when no DLQ record exists at
+    /// the target offset, and `GroupNotFound` when the target group isn't
+    /// registered (we refuse to create orphan pending records).
+    ///
+    /// Ordering: put pending first, then delete DLQ. A crash in-between
+    /// leaves a duplicate (entry present in both namespaces) — acceptable;
+    /// the opposite ordering would risk loss.
+    pub async fn replay(
+        &self,
+        tenant_id: &str,
+        log: &str,
+        group: &str,
+        offset: u64,
+        ctx: &AuditContext,
+    ) -> Result<(), ScrollError> {
+        let resource = format!("{log}/{group}/{offset}");
+        let result = async {
+            self.check_policy(tenant_id, &resource, "replay", ctx)
+                .await?;
+            // Refuse orphan-pending: target group must exist.
+            let _ = groups::load(self.store.as_ref(), tenant_id, log, group).await?;
+
+            let dk = groups::dlq_key(tenant_id, log, offset);
+            let dlq_entry = match self.store.get(DLQ_NS, &dk, None).await {
+                Ok(e) => e,
+                Err(StoreError::NotFound) => {
+                    return Err(ScrollError::DlqEntryNotFound {
+                        log: log.to_string(),
+                        offset,
+                    });
+                }
+                Err(e) => return Err(ScrollError::Store(format!("dlq get: {e}"))),
+            };
+            let dlq: DlqEntry = serde_json::from_slice(&dlq_entry.value)
+                .map_err(|e| ScrollError::Store(format!("corrupt dlq record: {e}")))?;
+
+            let now = now_ms();
+            let pending = PendingEntry {
+                offset,
+                reader_id: dlq.reader_id,
+                delivered_at_ms: now,
+                delivery_count: 1,
+            };
+            let pv = serde_json::to_vec(&pending)
+                .map_err(|e| ScrollError::Internal(format!("pending encode: {e}")))?;
+            let pk = groups::pending_key(tenant_id, log, group, offset);
+            self.store
+                .put(PENDING_NS, &pk, &pv, None)
+                .await
+                .map_err(|e| ScrollError::Store(format!("pending put: {e}")))?;
+            match self.store.delete(DLQ_NS, &dk).await {
+                Ok(_) | Err(StoreError::NotFound) => Ok(()),
+                Err(e) => Err(ScrollError::Store(format!("dlq delete: {e}"))),
+            }
+        }
+        .await;
+        self.emit_audit("REPLAY", tenant_id, &resource, event_result(&result), ctx)
+            .await;
+        result
+    }
+
+    /// DELETE_GROUP. Resolves SPEC §17 Q7. Explicitly tears down a single
+    /// reader group: `delete_prefix` every pending record, then delete the
+    /// group row. Sentry-gated; audited on both success and failure. Returns
+    /// `GroupNotFound` when the group doesn't exist — no silent no-op.
+    ///
+    /// Counterpart to `CREATE_GROUP`. Unlike `DELETE_LOG`, this doesn't
+    /// touch `scroll.logs` or the DEK — other groups on the same log keep
+    /// operating normally.
+    pub async fn delete_group(
+        &self,
+        tenant_id: &str,
+        log: &str,
+        group: &str,
+        ctx: &AuditContext,
+    ) -> Result<(), ScrollError> {
+        let resource = format!("{log}/{group}");
+        let result = async {
+            self.check_policy(tenant_id, &resource, "delete_group", ctx)
+                .await?;
+            // Verify existence — surfaces stale operator commands rather
+            // than silently no-op'ing.
+            let _ = groups::load(self.store.as_ref(), tenant_id, log, group).await?;
+
+            let pending_prefix = groups::pending_prefix(tenant_id, log, group);
+            self.store
+                .delete_prefix(PENDING_NS, &pending_prefix)
+                .await
+                .map_err(|e| ScrollError::Store(format!("delete_prefix pending: {e}")))?;
+
+            let gk = groups::group_key(tenant_id, log, group);
+            match self.store.delete(GROUPS_NS, &gk).await {
+                Ok(_) | Err(StoreError::NotFound) => Ok(()),
+                Err(e) => Err(ScrollError::Store(format!("group delete: {e}"))),
+            }
+        }
+        .await;
+        self.emit_audit(
+            "DELETE_GROUP",
+            tenant_id,
+            &resource,
+            event_result(&result),
+            ctx,
+        )
+        .await;
+        result
+    }
+
     /// ACK. Idempotent: a double-ack returns Ok.
     pub async fn ack(
         &self,
@@ -2338,6 +2453,204 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(next, 5);
+    }
+
+    // ── REPLAY (SPEC §17 Q4) ────────────────────────────────────────────
+
+    /// Helper: drive `claim_moves_to_dlq_on_delivery_breach`'s DLQ setup
+    /// so the replay tests can operate on a known DLQ state.
+    async fn seed_dlq_entry() -> (
+        ScrollEngine<shroudb_storage::EmbeddedStore>,
+        Arc<shroudb_storage::EmbeddedStore>,
+    ) {
+        let store = shroudb_storage::test_util::create_test_store(&format!(
+            "scroll-replay-{}",
+            uuid::Uuid::new_v4()
+        ))
+        .await;
+        let caps = Capabilities::new().with_cipher(FakeCipher::new());
+        let cfg = EngineConfig {
+            max_delivery_count: 1,
+            dlq_retention_ttl_ms: None, // keep DLQ entries forever for the test
+            ..EngineConfig::default()
+        };
+        let eng = ScrollEngine::new(store.clone(), caps, cfg).await.unwrap();
+
+        eng.append("t", "l", b"x".to_vec(), BTreeMap::new(), None, &ctx())
+            .await
+            .unwrap();
+        eng.create_group("t", "l", "g", 0, &ctx()).await.unwrap();
+        eng.read_group("t", "l", "g", "r1", 10, &ctx())
+            .await
+            .unwrap();
+        // delivery_count = 1 after READ_GROUP; max_delivery_count = 1, so the
+        // next CLAIM tips it over and moves to DLQ.
+        eng.claim("t", "l", "g", "r2", 0, &ctx()).await.unwrap();
+        (eng, store)
+    }
+
+    #[tokio::test]
+    async fn replay_moves_dlq_entry_back_to_pending() {
+        let (eng, store) = seed_dlq_entry().await;
+        let dk = crate::groups::dlq_key("t", "l", 0);
+        assert!(store.get(DLQ_NS, &dk, None).await.is_ok());
+        assert_eq!(
+            eng.group_info("t", "l", "g", &ctx())
+                .await
+                .unwrap()
+                .pending_count,
+            0
+        );
+
+        eng.replay("t", "l", "g", 0, &ctx()).await.unwrap();
+
+        // Pending restored, DLQ row removed.
+        assert_eq!(
+            eng.group_info("t", "l", "g", &ctx())
+                .await
+                .unwrap()
+                .pending_count,
+            1
+        );
+        assert!(matches!(
+            store.get(DLQ_NS, &dk, None).await,
+            Err(shroudb_store::StoreError::NotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn replay_missing_dlq_entry_returns_dlq_entry_not_found() {
+        let eng = new_engine().await;
+        eng.append("t", "l", b"x".to_vec(), BTreeMap::new(), None, &ctx())
+            .await
+            .unwrap();
+        eng.create_group("t", "l", "g", 0, &ctx()).await.unwrap();
+        let err = eng.replay("t", "l", "g", 42, &ctx()).await.unwrap_err();
+        match err {
+            ScrollError::DlqEntryNotFound { log, offset } => {
+                assert_eq!(log, "l");
+                assert_eq!(offset, 42);
+            }
+            other => panic!("expected DlqEntryNotFound, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn replay_to_missing_group_is_rejected() {
+        // Orphan pending records are a correctness hazard — require the
+        // target group to exist.
+        let (eng, _) = seed_dlq_entry().await;
+        let err = eng
+            .replay("t", "l", "nonexistent", 0, &ctx())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ScrollError::GroupNotFound { .. }));
+    }
+
+    #[tokio::test]
+    async fn replay_preserves_reader_id_from_dlq_record() {
+        let (eng, store) = seed_dlq_entry().await;
+        // The seeded DLQ record was produced from r1's pending; READ_GROUP
+        // recorded reader_id = "r1" when it created the original pending.
+        eng.replay("t", "l", "g", 0, &ctx()).await.unwrap();
+
+        // Read the restored pending directly and verify the reader_id
+        // carried over from the DLQ record, delivery_count reset to 1,
+        // delivered_at_ms was stamped fresh.
+        let pk = crate::groups::pending_key("t", "l", "g", 0);
+        let entry = shroudb_store::Store::get(store.as_ref(), PENDING_NS, &pk, None)
+            .await
+            .expect("pending row must exist after replay");
+        let pending: PendingEntry = serde_json::from_slice(&entry.value).expect("pending decodes");
+        assert_eq!(pending.offset, 0);
+        assert_eq!(pending.reader_id, "r1");
+        assert_eq!(pending.delivery_count, 1);
+        assert!(pending.delivered_at_ms > 0);
+    }
+
+    // ── DELETE_GROUP (SPEC §17 Q7) ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn delete_group_removes_pending_and_group_row() {
+        let eng = new_engine().await;
+        for i in 0..3u8 {
+            eng.append("t", "l", vec![i], BTreeMap::new(), None, &ctx())
+                .await
+                .unwrap();
+        }
+        eng.create_group("t", "l", "g", 0, &ctx()).await.unwrap();
+        eng.read_group("t", "l", "g", "r", 10, &ctx())
+            .await
+            .unwrap();
+        assert_eq!(
+            eng.group_info("t", "l", "g", &ctx())
+                .await
+                .unwrap()
+                .pending_count,
+            3
+        );
+
+        eng.delete_group("t", "l", "g", &ctx()).await.unwrap();
+
+        let err = eng.group_info("t", "l", "g", &ctx()).await.unwrap_err();
+        assert!(matches!(err, ScrollError::GroupNotFound { .. }));
+    }
+
+    #[tokio::test]
+    async fn delete_group_on_missing_group_returns_group_not_found() {
+        let eng = new_engine().await;
+        eng.append("t", "l", b"x".to_vec(), BTreeMap::new(), None, &ctx())
+            .await
+            .unwrap();
+        let err = eng
+            .delete_group("t", "l", "ghost", &ctx())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ScrollError::GroupNotFound { .. }));
+    }
+
+    #[tokio::test]
+    async fn delete_group_leaves_other_groups_alone() {
+        let eng = new_engine().await;
+        for i in 0..3u8 {
+            eng.append("t", "l", vec![i], BTreeMap::new(), None, &ctx())
+                .await
+                .unwrap();
+        }
+        eng.create_group("t", "l", "victim", 0, &ctx())
+            .await
+            .unwrap();
+        eng.create_group("t", "l", "survivor", 0, &ctx())
+            .await
+            .unwrap();
+        eng.read_group("t", "l", "survivor", "r", 10, &ctx())
+            .await
+            .unwrap();
+
+        eng.delete_group("t", "l", "victim", &ctx()).await.unwrap();
+
+        // Survivor still has its pending records + cursor intact.
+        let survivor = eng.group_info("t", "l", "survivor", &ctx()).await.unwrap();
+        assert_eq!(survivor.pending_count, 3);
+
+        // Log itself and its other commands still work.
+        let info = eng.log_info("t", "l", &ctx()).await.unwrap();
+        assert_eq!(info.entries_minted, 3);
+    }
+
+    #[tokio::test]
+    async fn delete_group_does_not_touch_log_entries() {
+        let eng = new_engine().await;
+        for i in 0..3u8 {
+            eng.append("t", "l", vec![i], BTreeMap::new(), None, &ctx())
+                .await
+                .unwrap();
+        }
+        eng.create_group("t", "l", "g", 0, &ctx()).await.unwrap();
+        eng.delete_group("t", "l", "g", &ctx()).await.unwrap();
+
+        let got = eng.read("t", "l", 0, 100, &ctx()).await.unwrap();
+        assert_eq!(got.len(), 3);
     }
 
     // ── Retention guardrail (SPEC §17 Q2) ───────────────────────────────

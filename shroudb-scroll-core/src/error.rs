@@ -17,6 +17,12 @@ pub enum ScrollError {
     #[error("group already exists: {log}/{group}")]
     GroupExists { log: String, group: String },
 
+    /// Requested DLQ entry is not present (already reaped, replayed, or
+    /// never there). Returned by `REPLAY` when the target offset has no
+    /// record in `scroll.dlq` for the log.
+    #[error("dlq entry not found: {log}/{offset}")]
+    DlqEntryNotFound { log: String, offset: u64 },
+
     /// Requested offset range has been retained-away (SPEC §8).
     #[error("range compacted: earliest available offset is {earliest}")]
     CompactedRange { earliest: u64 },
@@ -50,4 +56,61 @@ pub enum ScrollError {
         resource: String,
         policy: String,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn display_entry_too_large_shows_size_and_max() {
+        let e = ScrollError::EntryTooLarge {
+            size: 2048,
+            max: 1024,
+        };
+        let s = e.to_string();
+        assert!(s.contains("2048"));
+        assert!(s.contains("1024"));
+    }
+
+    #[test]
+    fn display_group_not_found_shows_log_and_group() {
+        let e = ScrollError::GroupNotFound {
+            log: "orders".into(),
+            group: "workers".into(),
+        };
+        let s = e.to_string();
+        assert!(s.contains("orders"));
+        assert!(s.contains("workers"));
+    }
+
+    #[test]
+    fn display_dlq_entry_not_found_shows_log_and_offset() {
+        let e = ScrollError::DlqEntryNotFound {
+            log: "orders".into(),
+            offset: 42,
+        };
+        let s = e.to_string();
+        assert!(s.contains("orders"));
+        assert!(s.contains("42"));
+    }
+
+    #[test]
+    fn display_access_denied_shows_all_three_fields() {
+        let e = ScrollError::AccessDenied {
+            action: "append".into(),
+            resource: "orders".into(),
+            policy: "tenant-isolation".into(),
+        };
+        let s = e.to_string();
+        assert!(s.contains("append"));
+        assert!(s.contains("orders"));
+        assert!(s.contains("tenant-isolation"));
+    }
+
+    #[test]
+    fn display_capability_missing_shows_name() {
+        let e = ScrollError::CapabilityMissing("cipher".into());
+        assert!(e.to_string().contains("cipher"));
+    }
 }

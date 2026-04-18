@@ -71,6 +71,15 @@ pub enum ScrollCommand {
         limit: u32,
         timeout_ms: Option<u64>,
     },
+    Replay {
+        log: String,
+        group: String,
+        offset: u64,
+    },
+    DeleteGroup {
+        log: String,
+        group: String,
+    },
 
     // ── Meta commands ──────────────────────────────────────────────────
     Auth {
@@ -87,9 +96,11 @@ impl ScrollCommand {
     /// write scope. Meta commands require no ACL.
     pub fn acl_requirement(&self) -> AclRequirement {
         let (log, scope) = match self {
-            Self::Append { log, .. } | Self::DeleteLog { log } | Self::Trim { log, .. } => {
-                (log.as_str(), Scope::Write)
-            }
+            Self::Append { log, .. }
+            | Self::DeleteLog { log }
+            | Self::Trim { log, .. }
+            | Self::Replay { log, .. }
+            | Self::DeleteGroup { log, .. } => (log.as_str(), Scope::Write),
             Self::CreateGroup { log, .. } => (log.as_str(), Scope::Write),
             Self::Read { log, .. }
             | Self::ReadGroup { log, .. }
@@ -123,6 +134,8 @@ impl ScrollCommand {
             Self::Claim { .. } => "CLAIM",
             Self::Trim { .. } => "TRIM",
             Self::Tail { .. } => "TAIL",
+            Self::Replay { .. } => "REPLAY",
+            Self::DeleteGroup { .. } => "DELETE_GROUP",
             Self::Auth { .. } => "AUTH",
             Self::Health => "HEALTH",
             Self::Ping => "PING",
@@ -148,6 +161,8 @@ pub fn parse_command(args: &[&str]) -> Result<ScrollCommand, String> {
         "CLAIM" => parse_claim(&args[1..]),
         "TRIM" => parse_trim(&args[1..]),
         "TAIL" => parse_tail(&args[1..]),
+        "REPLAY" => parse_replay(&args[1..]),
+        "DELETE_GROUP" => parse_delete_group(&args[1..]),
         "AUTH" => {
             let token = args
                 .get(1)
@@ -360,6 +375,29 @@ fn parse_tail(args: &[&str]) -> Result<ScrollCommand, String> {
         from_offset,
         limit,
         timeout_ms,
+    })
+}
+
+fn parse_replay(args: &[&str]) -> Result<ScrollCommand, String> {
+    if args.len() != 3 {
+        return Err("REPLAY requires <log> <group> <offset>".into());
+    }
+    Ok(ScrollCommand::Replay {
+        log: args[0].to_string(),
+        group: args[1].to_string(),
+        offset: args[2]
+            .parse::<u64>()
+            .map_err(|_| format!("offset must be u64 (got {})", args[2]))?,
+    })
+}
+
+fn parse_delete_group(args: &[&str]) -> Result<ScrollCommand, String> {
+    if args.len() != 2 {
+        return Err("DELETE_GROUP requires <log> <group>".into());
+    }
+    Ok(ScrollCommand::DeleteGroup {
+        log: args[0].to_string(),
+        group: args[1].to_string(),
     })
 }
 

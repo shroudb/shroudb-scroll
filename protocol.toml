@@ -111,6 +111,27 @@ parameters = [
 ]
 response = { status = "string" }
 
+[commands.DELETE_GROUP]
+syntax = "DELETE_GROUP <log> <group>"
+description = "Tear down a single reader group: delete every pending record, then remove the group row. Counterpart to CREATE_GROUP; doesn't touch scroll.logs or the DEK, so other groups on the same log keep operating. Returns 'group not found' when the target doesn't exist. Resolves SPEC §17 Q7."
+acl = { namespace = "scroll.<log>", scope = "write" }
+parameters = [
+    { name = "log", type = "string", required = true },
+    { name = "group", type = "string", required = true },
+]
+response = { status = "string" }
+
+[commands.REPLAY]
+syntax = "REPLAY <log> <group> <offset>"
+description = "Move a DLQ entry back into a group's pending set. Preserves the original reader_id from the DLQ record, resets delivery_count to 1, stamps a fresh delivered_at_ms. Put-pending-first / delete-dlq-second ordering: a crash in-between leaves a duplicate, never a loss. Returns 'dlq entry not found' when the offset has no DLQ record, 'group not found' when the target group doesn't exist. Resolves SPEC §17 Q4."
+acl = { namespace = "scroll.<log>", scope = "write" }
+parameters = [
+    { name = "log", type = "string", required = true },
+    { name = "group", type = "string", required = true, description = "Target group to re-deliver into" },
+    { name = "offset", type = "integer", required = true, description = "Offset of the DLQ entry to replay" },
+]
+response = { status = "string" }
+
 [commands.CLAIM]
 syntax = "CLAIM <log> <group> <reader_id> <min_idle_ms>"
 description = "Reassign stalled pending entries to a new reader. Entries whose delivery_count would cross max_delivery_count are moved to scroll.dlq instead."

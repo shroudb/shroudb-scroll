@@ -240,6 +240,36 @@ impl ScrollClient {
         Ok(())
     }
 
+    /// Resolves SPEC §17 Q4. Move a DLQ entry at `offset` back into the
+    /// given group's pending set. Preserves the original reader_id, resets
+    /// delivery_count to 1. Returns `Server` error for `DlqEntryNotFound`
+    /// or `GroupNotFound`.
+    pub async fn replay(&self, log: &str, group: &str, offset: u64) -> Result<(), ClientError> {
+        let off = offset.to_string();
+        let resp = self
+            .conn
+            .lock()
+            .await
+            .command(&["REPLAY", log, group, &off])
+            .await?;
+        check_status(&resp)?;
+        Ok(())
+    }
+
+    /// Resolves SPEC §17 Q7. Tear down a single reader group: deletes
+    /// every pending record for the group, then removes the group row.
+    /// Other groups on the same log are untouched.
+    pub async fn delete_group(&self, log: &str, group: &str) -> Result<(), ClientError> {
+        let resp = self
+            .conn
+            .lock()
+            .await
+            .command(&["DELETE_GROUP", log, group])
+            .await?;
+        check_status(&resp)?;
+        Ok(())
+    }
+
     // ── Introspection ───────────────────────────────────────────────────
 
     pub async fn log_info(&self, log: &str) -> Result<Value, ClientError> {

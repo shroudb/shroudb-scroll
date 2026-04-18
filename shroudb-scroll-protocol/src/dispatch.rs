@@ -24,6 +24,8 @@ const SUPPORTED_COMMANDS: &[&str] = &[
     "CLAIM",
     "TRIM",
     "TAIL",
+    "REPLAY",
+    "DELETE_GROUP",
     "AUTH",
     "HEALTH",
     "PING",
@@ -202,6 +204,26 @@ pub async fn dispatch<S: Store>(
                 ScrollResponse::error(e.to_string())
             }
         },
+
+        ScrollCommand::Replay { log, group, offset } => {
+            match engine.replay(&tenant, &log, &group, offset, &ctx).await {
+                Ok(()) => ScrollResponse::ok_status(),
+                Err(e) => {
+                    warn!(log, group, offset, error = %e, "REPLAY failed");
+                    ScrollResponse::error(e.to_string())
+                }
+            }
+        }
+
+        ScrollCommand::DeleteGroup { log, group } => {
+            match engine.delete_group(&tenant, &log, &group, &ctx).await {
+                Ok(()) => ScrollResponse::ok_status(),
+                Err(e) => {
+                    warn!(log, group, error = %e, "DELETE_GROUP failed");
+                    ScrollResponse::error(e.to_string())
+                }
+            }
+        }
     }
 }
 
@@ -546,6 +568,72 @@ mod tests {
         .await;
         let body = ok_body(resp);
         assert_eq!(body["entries"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn delete_group_via_dispatch() {
+        let eng = new_engine().await;
+        dispatch(&eng, parse_command(&["APPEND", "l", "YQ=="]).unwrap(), None).await;
+        dispatch(
+            &eng,
+            parse_command(&["CREATE_GROUP", "l", "g", "0"]).unwrap(),
+            None,
+        )
+        .await;
+
+        let resp = dispatch(
+            &eng,
+            parse_command(&["DELETE_GROUP", "l", "g"]).unwrap(),
+            None,
+        )
+        .await;
+        assert_eq!(ok_body(resp)["status"], "ok");
+
+        // Subsequent GROUP_INFO must report the group gone.
+        let resp = dispatch(
+            &eng,
+            parse_command(&["GROUP_INFO", "l", "g"]).unwrap(),
+            None,
+        )
+        .await;
+        assert!(matches!(resp, ScrollResponse::Error(_)));
+    }
+
+    #[tokio::test]
+    async fn delete_group_missing_group_returns_error() {
+        let eng = new_engine().await;
+        dispatch(&eng, parse_command(&["APPEND", "l", "YQ=="]).unwrap(), None).await;
+        let resp = dispatch(
+            &eng,
+            parse_command(&["DELETE_GROUP", "l", "ghost"]).unwrap(),
+            None,
+        )
+        .await;
+        let err = err_msg(resp);
+        assert!(err.contains("group not found"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn replay_missing_dlq_entry_via_dispatch_returns_error() {
+        let eng = new_engine().await;
+        dispatch(&eng, parse_command(&["APPEND", "l", "YQ=="]).unwrap(), None).await;
+        dispatch(
+            &eng,
+            parse_command(&["CREATE_GROUP", "l", "g", "0"]).unwrap(),
+            None,
+        )
+        .await;
+        let resp = dispatch(
+            &eng,
+            parse_command(&["REPLAY", "l", "g", "42"]).unwrap(),
+            None,
+        )
+        .await;
+        let err = err_msg(resp);
+        assert!(
+            err.contains("dlq entry not found"),
+            "expected DlqEntryNotFound, got: {err}"
+        );
     }
 
     #[tokio::test]

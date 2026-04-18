@@ -81,6 +81,15 @@ enum Command {
     DeleteLog {
         log: String,
     },
+    DeleteGroup {
+        log: String,
+        group: String,
+    },
+    Replay {
+        log: String,
+        group: String,
+        offset: u64,
+    },
     LogInfo {
         log: String,
     },
@@ -177,6 +186,14 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::DeleteLog { log } => {
             client.delete_log(&log).await?;
+            println!("ok");
+        }
+        Command::DeleteGroup { log, group } => {
+            client.delete_group(&log, &group).await?;
+            println!("ok");
+        }
+        Command::Replay { log, group, offset } => {
+            client.replay(&log, &group, offset).await?;
             println!("ok");
         }
         Command::LogInfo { log } => {
