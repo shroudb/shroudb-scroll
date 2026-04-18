@@ -353,7 +353,7 @@ mod tests {
 
     async fn new_engine() -> ScrollEngine<shroudb_storage::EmbeddedStore> {
         let store = shroudb_storage::test_util::create_test_store("scroll-proto").await;
-        let caps = Capabilities::new().with_cipher(FakeCipher::new());
+        let caps = Capabilities::for_tests().with_cipher(FakeCipher::new());
         ScrollEngine::new(store, caps, EngineConfig::default())
             .await
             .unwrap()

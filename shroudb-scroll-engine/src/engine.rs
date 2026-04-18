@@ -244,10 +244,10 @@ impl<S: Store> ScrollEngine<S> {
     /// Cipher; this returns `CapabilityMissing("cipher")` fail-closed when
     /// absent rather than silently storing/returning plaintext.
     fn require_cipher(&self) -> Result<&dyn crate::capabilities::ScrollCipherOps, ScrollError> {
-        self.caps
-            .cipher
-            .as_deref()
-            .ok_or_else(|| ScrollError::CapabilityMissing("cipher".into()))
+        match self.caps.cipher.as_ref() {
+            Some(arc) => Ok(arc.as_ref()),
+            None => Err(ScrollError::CapabilityMissing("cipher".into())),
+        }
     }
 
     /// ABAC gate — evaluates every command when Sentry is configured.
@@ -1765,7 +1765,7 @@ mod tests {
 
     async fn new_engine() -> ScrollEngine<shroudb_storage::EmbeddedStore> {
         let store = shroudb_storage::test_util::create_test_store("scroll-test").await;
-        let caps = Capabilities::new().with_cipher(FakeCipher::new());
+        let caps = Capabilities::for_tests().with_cipher(FakeCipher::new());
         ScrollEngine::new(store, caps, EngineConfig::default())
             .await
             .expect("engine new")
@@ -1773,7 +1773,7 @@ mod tests {
 
     async fn new_engine_without_cipher() -> ScrollEngine<shroudb_storage::EmbeddedStore> {
         let store = shroudb_storage::test_util::create_test_store("scroll-nocipher").await;
-        ScrollEngine::new(store, Capabilities::new(), EngineConfig::default())
+        ScrollEngine::new(store, Capabilities::for_tests(), EngineConfig::default())
             .await
             .expect("engine new")
     }
@@ -2121,7 +2121,7 @@ mod tests {
 
         // Phase 1: write with cipher.
         let store1 = shroudb_storage::test_util::create_test_store(&shared_ns).await;
-        let caps = Capabilities::new().with_cipher(FakeCipher::new());
+        let caps = Capabilities::for_tests().with_cipher(FakeCipher::new());
         let eng = ScrollEngine::new(store1.clone(), caps, EngineConfig::default())
             .await
             .unwrap();
@@ -2131,7 +2131,7 @@ mod tests {
         eng.create_group("t", "l", "g", 0, &ctx()).await.unwrap();
 
         // Phase 2: same store, Cipher-less engine, metadata still inspectable.
-        let bare = ScrollEngine::new(store1, Capabilities::new(), EngineConfig::default())
+        let bare = ScrollEngine::new(store1, Capabilities::for_tests(), EngineConfig::default())
             .await
             .unwrap();
         let info = bare.log_info("t", "l", &ctx()).await.unwrap();
@@ -2150,7 +2150,7 @@ mod tests {
     async fn sentry_deny_blocks_append() {
         let store = shroudb_storage::test_util::create_test_store("scroll-sentry-deny").await;
         let policy = FakePolicy::deny();
-        let caps = Capabilities::new()
+        let caps = Capabilities::for_tests()
             .with_cipher(FakeCipher::new())
             .with_sentry(policy.clone());
         let eng = ScrollEngine::new(store, caps, EngineConfig::default())
@@ -2186,7 +2186,7 @@ mod tests {
     #[tokio::test]
     async fn sentry_deny_blocks_reads() {
         let store = shroudb_storage::test_util::create_test_store("scroll-sentry-reads").await;
-        let caps = Capabilities::new()
+        let caps = Capabilities::for_tests()
             .with_cipher(FakeCipher::new())
             .with_sentry(FakePolicy::deny());
         let eng = ScrollEngine::new(store, caps, EngineConfig::default())
@@ -2214,7 +2214,7 @@ mod tests {
     #[tokio::test]
     async fn sentry_permit_lets_operations_through() {
         let store = shroudb_storage::test_util::create_test_store("scroll-sentry-permit").await;
-        let caps = Capabilities::new()
+        let caps = Capabilities::for_tests()
             .with_cipher(FakeCipher::new())
             .with_sentry(FakePolicy::permit());
         let eng = ScrollEngine::new(store, caps, EngineConfig::default())
@@ -2233,7 +2233,7 @@ mod tests {
     async fn chronicle_records_append_create_ack_delete() {
         let store = shroudb_storage::test_util::create_test_store("scroll-chronicle").await;
         let chron = FakeChronicle::new();
-        let caps = Capabilities::new()
+        let caps = Capabilities::for_tests()
             .with_cipher(FakeCipher::new())
             .with_chronicle(chron.clone());
         let eng = ScrollEngine::new(store, caps, EngineConfig::default())
@@ -2275,7 +2275,7 @@ mod tests {
     async fn chronicle_records_failure_on_denied_append() {
         let store = shroudb_storage::test_util::create_test_store("scroll-chronicle-fail").await;
         let chron = FakeChronicle::new();
-        let caps = Capabilities::new()
+        let caps = Capabilities::for_tests()
             .with_cipher(FakeCipher::new())
             .with_sentry(FakePolicy::deny())
             .with_chronicle(chron.clone());
@@ -2306,7 +2306,7 @@ mod tests {
     async fn chronicle_not_invoked_for_reads() {
         let store = shroudb_storage::test_util::create_test_store("scroll-chronicle-reads").await;
         let chron = FakeChronicle::new();
-        let caps = Capabilities::new()
+        let caps = Capabilities::for_tests()
             .with_cipher(FakeCipher::new())
             .with_chronicle(chron.clone());
         let eng = ScrollEngine::new(store, caps, EngineConfig::default())
@@ -2430,7 +2430,7 @@ mod tests {
         // A 50ms DLQ TTL: force one DLQ move, then wait past the TTL and
         // confirm the DLQ row is gone (Store sweeper evicted it).
         let store = shroudb_storage::test_util::create_test_store("scroll-dlq-ttl").await;
-        let caps = Capabilities::new().with_cipher(FakeCipher::new());
+        let caps = Capabilities::for_tests().with_cipher(FakeCipher::new());
         let cfg = EngineConfig {
             max_delivery_count: 1,
             dlq_retention_ttl_ms: Some(50),
@@ -2467,7 +2467,7 @@ mod tests {
     async fn claim_moves_to_dlq_on_delivery_breach() {
         // Use a tiny max_delivery_count so repeated CLAIMs tip over quickly.
         let store = shroudb_storage::test_util::create_test_store("scroll-dlq").await;
-        let caps = Capabilities::new().with_cipher(FakeCipher::new());
+        let caps = Capabilities::for_tests().with_cipher(FakeCipher::new());
         let cfg = EngineConfig {
             max_delivery_count: 2,
             ..EngineConfig::default()
@@ -2580,7 +2580,7 @@ mod tests {
             uuid::Uuid::new_v4()
         ))
         .await;
-        let caps = Capabilities::new().with_cipher(FakeCipher::new());
+        let caps = Capabilities::for_tests().with_cipher(FakeCipher::new());
         let cfg = EngineConfig {
             max_delivery_count: 1,
             dlq_retention_ttl_ms: None, // keep DLQ entries forever for the test
@@ -2770,7 +2770,7 @@ mod tests {
     #[tokio::test]
     async fn trim_respects_slowest_group_guardrail_max_len() {
         let store = shroudb_storage::test_util::create_test_store("scroll-q2-len").await;
-        let caps = Capabilities::new().with_cipher(FakeCipher::new());
+        let caps = Capabilities::for_tests().with_cipher(FakeCipher::new());
         let cfg = EngineConfig {
             min_retention_behind_slowest_group: 3,
             ..EngineConfig::default()
@@ -2814,7 +2814,7 @@ mod tests {
     #[tokio::test]
     async fn trim_guardrail_pins_to_slowest_of_multiple_groups() {
         let store = shroudb_storage::test_util::create_test_store("scroll-q2-slowest").await;
-        let caps = Capabilities::new().with_cipher(FakeCipher::new());
+        let caps = Capabilities::for_tests().with_cipher(FakeCipher::new());
         let cfg = EngineConfig {
             min_retention_behind_slowest_group: 1,
             ..EngineConfig::default()
@@ -2846,7 +2846,7 @@ mod tests {
     #[tokio::test]
     async fn trim_guardrail_no_groups_allows_full_trim() {
         let store = shroudb_storage::test_util::create_test_store("scroll-q2-nogroup").await;
-        let caps = Capabilities::new().with_cipher(FakeCipher::new());
+        let caps = Capabilities::for_tests().with_cipher(FakeCipher::new());
         let cfg = EngineConfig {
             min_retention_behind_slowest_group: 100,
             ..EngineConfig::default()
@@ -2867,7 +2867,7 @@ mod tests {
         // start_offset=0 → u64::MAX sentinel ("nothing delivered") → maps to
         // next_unconsumed = 0 → guardrail ceiling = 0 → nothing trimmable.
         let store = shroudb_storage::test_util::create_test_store("scroll-q2-fresh").await;
-        let caps = Capabilities::new().with_cipher(FakeCipher::new());
+        let caps = Capabilities::for_tests().with_cipher(FakeCipher::new());
         let cfg = EngineConfig {
             min_retention_behind_slowest_group: 1,
             ..EngineConfig::default()

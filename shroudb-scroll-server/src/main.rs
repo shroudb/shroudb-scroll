@@ -1,10 +1,17 @@
 use anyhow::Context;
 use clap::Parser;
-use shroudb_scroll_engine::{Capabilities, EngineConfig as EngConfig, ScrollEngine};
+use shroudb_cipher_core::keyring::KeyringAlgorithm;
+use shroudb_cipher_engine::engine::{CipherConfig, CipherEngine};
+use shroudb_cipher_engine::scheduler;
+use shroudb_scroll_engine::{
+    Capabilities, EngineConfig as EngConfig, ScrollCipherOps, ScrollEngine,
+};
+use shroudb_storage::{EmbeddedStore, StorageEngine};
 use shroudb_store::Store;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 
+mod cipher_embedded;
 mod cipher_remote;
 mod config;
 mod tcp;
@@ -30,6 +37,12 @@ async fn main() -> anyhow::Result<()> {
         cfg.store.data_dir = data_dir;
     }
 
+    if let Some(ref cipher_cfg) = cfg.cipher {
+        cipher_cfg
+            .validate(&cfg.store.mode)
+            .context("invalid cipher config")?;
+    }
+
     let log_level = cli
         .log_level
         .or(cfg.server.log_level.clone())
@@ -43,8 +56,9 @@ async fn main() -> anyhow::Result<()> {
             let storage = shroudb_server_bootstrap::open_storage(&data_dir, key_source.as_ref())
                 .await
                 .context("failed to open storage engine")?;
-            let store = Arc::new(shroudb_storage::EmbeddedStore::new(storage, "scroll"));
-            run_server(cfg, store).await
+            let scroll_store = Arc::new(EmbeddedStore::new(storage.clone(), "scroll"));
+            let cipher_handle = build_cipher_embedded(&cfg, storage.clone()).await?;
+            run_server(cfg, scroll_store, Some(storage), cipher_handle).await
         }
         "remote" => {
             let uri = cfg
@@ -58,42 +72,160 @@ async fn main() -> anyhow::Result<()> {
                     .await
                     .context("failed to connect to remote store")?,
             );
-            run_server(cfg, store).await
+            run_server(cfg, store, None, None).await
         }
         other => anyhow::bail!("unknown store mode: {other}"),
     }
 }
 
+/// Build an embedded `CipherEngine` if configured. Returns `None` when the
+/// config selects remote or omits Cipher entirely — the caller wires the
+/// remote client or leaves the capability absent (fail-closed at use site).
+async fn build_cipher_embedded(
+    cfg: &config::ScrollServerConfig,
+    storage: Arc<StorageEngine>,
+) -> anyhow::Result<Option<CipherEmbeddedHandle>> {
+    let Some(cc) = cfg.cipher.as_ref() else {
+        return Ok(None);
+    };
+    if !cc.is_embedded() {
+        return Ok(None);
+    }
+
+    let cipher_store = Arc::new(EmbeddedStore::new(storage, "cipher"));
+    let cipher_config = CipherConfig {
+        default_rotation_days: cc.rotation_days,
+        default_drain_days: cc.drain_days,
+        scheduler_interval_secs: cc.scheduler_interval_secs,
+    };
+    let engine = CipherEngine::new(cipher_store, cipher_config, None, None)
+        .await
+        .map_err(|e| anyhow::anyhow!("embedded cipher init failed: {e}"))?;
+
+    let algorithm: KeyringAlgorithm = cc
+        .algorithm
+        .parse()
+        .map_err(|e| anyhow::anyhow!("invalid cipher algorithm {:?}: {e}", cc.algorithm))?;
+
+    match engine
+        .keyring_create(&cc.keyring, algorithm, None, None, false, None)
+        .await
+    {
+        Ok(_) => tracing::info!(keyring = %cc.keyring, "seeded embedded cipher keyring"),
+        Err(e) => tracing::debug!(keyring = %cc.keyring, error = %e, "keyring seed skipped"),
+    }
+
+    let engine = Arc::new(engine);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let scheduler_handle =
+        scheduler::start_scheduler(engine.clone(), cc.scheduler_interval_secs, shutdown_rx);
+
+    tracing::info!(
+        keyring = %cc.keyring,
+        rotation_days = cc.rotation_days,
+        "embedded cipher initialized"
+    );
+
+    Ok(Some(CipherEmbeddedHandle {
+        engine,
+        keyring: cc.keyring.clone(),
+        scheduler: scheduler_handle,
+        shutdown_tx,
+    }))
+}
+
+struct CipherEmbeddedHandle {
+    engine: Arc<CipherEngine<EmbeddedStore>>,
+    keyring: String,
+    scheduler: tokio::task::JoinHandle<()>,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+}
+
 async fn run_server<S: Store + 'static>(
     cfg: config::ScrollServerConfig,
     store: Arc<S>,
+    storage: Option<Arc<shroudb_storage::StorageEngine>>,
+    cipher_embedded: Option<CipherEmbeddedHandle>,
 ) -> anyhow::Result<()> {
     let data_dir = std::path::PathBuf::from(&cfg.store.data_dir);
 
-    // Cipher is optional. If configured, build a remote client impl and wire
-    // it into `Capabilities`. If not, Scroll still starts — APPEND/READ/
-    // READ_GROUP/TAIL will fail-closed with CapabilityMissing("cipher").
-    let mut caps = Capabilities::new();
-    if let Some(cipher_cfg) = cfg.cipher.clone() {
-        let cipher = cipher_remote::RemoteCipherOps::connect(
-            &cipher_cfg.addr,
-            cipher_cfg.keyring.clone(),
-            cipher_cfg.auth_token.as_deref(),
+    // Audit (Chronicle) capability — remote, embedded, or explicitly
+    // disabled-with-justification. No silent None allowed.
+    let audit_cfg = cfg.audit.clone().ok_or_else(|| {
+        anyhow::anyhow!(
+            "missing [audit] config section. Pick one: \n  \
+             [audit] mode = \"remote\" addr = \"chronicle.internal:7300\"\n  \
+             [audit] mode = \"embedded\"\n  \
+             [audit] mode = \"disabled\" justification = \"<reason>\""
         )
+    })?;
+    let audit_cap = audit_cfg
+        .resolve(storage.clone())
         .await
-        .context("failed to connect to Cipher")?;
-        caps = caps.with_cipher(Arc::new(cipher));
-        tracing::info!(
-            addr = cipher_cfg.addr,
-            keyring = cipher_cfg.keyring,
-            "cipher wired"
-        );
-    } else {
-        tracing::warn!(
-            "no [cipher] section configured — APPEND/READ/READ_GROUP/TAIL will \
-             reject with CapabilityMissing. Add [cipher] to enable."
-        );
-    }
+        .context("failed to resolve [audit] capability")?;
+
+    // Policy (Sentry) capability — same contract.
+    let policy_cfg = cfg.policy.clone().ok_or_else(|| {
+        anyhow::anyhow!(
+            "missing [policy] config section. Pick one: \n  \
+             [policy] mode = \"remote\" addr = \"sentry.internal:7100\"\n  \
+             [policy] mode = \"embedded\"\n  \
+             [policy] mode = \"disabled\" justification = \"<reason>\""
+        )
+    })?;
+    let policy_cap = policy_cfg
+        .resolve(storage.clone(), audit_cap.as_ref().cloned())
+        .await
+        .context("failed to resolve [policy] capability")?;
+
+    let mut cipher_cap: shroudb_server_bootstrap::Capability<
+        Arc<dyn shroudb_scroll_engine::ScrollCipherOps>,
+    > = shroudb_server_bootstrap::Capability::disabled(
+        "no [cipher] section configured — explicitly opt out for teardown/inspection deployments",
+    );
+
+    let cipher_handle = match (cfg.cipher.as_ref(), cipher_embedded) {
+        (Some(cc), Some(handle)) if cc.is_embedded() => {
+            let ops = cipher_embedded::EmbeddedCipherOps::new(
+                handle.engine.clone(),
+                handle.keyring.clone(),
+            );
+            cipher_cap = shroudb_server_bootstrap::Capability::Enabled(
+                Arc::new(ops) as Arc<dyn ScrollCipherOps>
+            );
+            tracing::info!(
+                keyring = %handle.keyring,
+                "cipher wired (embedded)"
+            );
+            Some(handle)
+        }
+        (Some(cc), _) if cc.is_remote() => {
+            let addr = cc
+                .addr
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("cipher.mode = \"remote\" requires cipher.addr"))?;
+            let cipher = cipher_remote::RemoteCipherOps::connect(
+                addr,
+                cc.keyring.clone(),
+                cc.auth_token.as_deref(),
+            )
+            .await
+            .context("failed to connect to Cipher")?;
+            cipher_cap = shroudb_server_bootstrap::Capability::Enabled(
+                Arc::new(cipher) as Arc<dyn ScrollCipherOps>
+            );
+            tracing::info!(addr = addr, keyring = %cc.keyring, "cipher wired (remote)");
+            None
+        }
+        _ => {
+            tracing::warn!(
+                "no [cipher] section configured — APPEND/READ/READ_GROUP/TAIL will \
+                 reject with CapabilityMissing. Ensure this is intentional and record \
+                 a Capability::DisabledWithJustification(…) at config time."
+            );
+            None
+        }
+    };
 
     let engine_config = EngConfig {
         default_max_entry_bytes: cfg.engine.default_max_entry_bytes,
@@ -108,6 +240,7 @@ async fn run_server<S: Store + 'static>(
         dlq_retention_ttl_ms: cfg.engine.dlq_retention_ttl_ms,
         min_retention_behind_slowest_group: cfg.engine.min_retention_behind_slowest_group,
     };
+    let caps = Capabilities::new(cipher_cap, policy_cap, audit_cap);
     let engine = Arc::new(
         ScrollEngine::new(store, caps, engine_config)
             .await
@@ -152,6 +285,12 @@ async fn run_server<S: Store + 'static>(
 
     shroudb_server_bootstrap::wait_for_shutdown(shutdown_tx).await?;
     let _ = tcp_handle.await;
+
+    if let Some(handle) = cipher_handle {
+        let _ = handle.shutdown_tx.send(true);
+        let _ = handle.scheduler.await;
+    }
+
     Ok(())
 }
 

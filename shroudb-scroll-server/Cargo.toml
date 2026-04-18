@@ -20,9 +20,12 @@ shroudb-crypto = { workspace = true }
 shroudb-storage = { workspace = true }
 shroudb-client = { workspace = true }
 shroudb-cipher-client = { workspace = true }
+shroudb-cipher-engine = { workspace = true }
+shroudb-cipher-core = { workspace = true }
 shroudb-protocol-wire = { workspace = true }
 shroudb-server-tcp = { workspace = true }
 shroudb-server-bootstrap = { workspace = true }
+shroudb-engine-bootstrap = { workspace = true }
 shroudb-telemetry = { workspace = true }
 tokio-rustls = { workspace = true }
 base64 = { workspace = true }

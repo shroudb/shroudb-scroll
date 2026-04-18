@@ -1,5 +1,6 @@
 use serde::Deserialize;
 use shroudb_acl::ServerAuthConfig;
+use shroudb_engine_bootstrap::{AuditConfig, PolicyConfig};
 
 #[derive(Debug, Default, Deserialize)]
 pub struct ScrollServerConfig {
@@ -11,6 +12,13 @@ pub struct ScrollServerConfig {
     pub engine: EngineConfig,
     #[serde(default)]
     pub cipher: Option<CipherConfig>,
+    /// Audit (Chronicle) capability slot. Absent = fail-closed at
+    /// startup; operators must explicitly pick a mode.
+    #[serde(default)]
+    pub audit: Option<AuditConfig>,
+    /// Policy (Sentry) capability slot. Same contract as `audit`.
+    #[serde(default)]
+    pub policy: Option<PolicyConfig>,
     #[serde(default)]
     pub auth: ServerAuthConfig,
 }
@@ -137,22 +145,93 @@ fn default_dlq_ttl_ms() -> Option<i64> {
     Some(2_592_000_000)
 }
 
-/// Remote Cipher wiring. `addr` is a TCP `host:port`; `keyring` is the
-/// Cipher keyring used for per-log DEK generation; `auth_token` authenticates
-/// the Cipher client. Omit the whole section to run Scroll without Cipher —
-/// APPEND / READ / READ_GROUP / TAIL will fail-closed with
+/// Cipher wiring. Two modes:
+///
+/// - `mode = "remote"` (default): Scroll connects to an external
+///   `shroudb-cipher` server over TCP. Requires `addr`.
+/// - `mode = "embedded"`: Scroll builds an in-process `CipherEngine`
+///   backed by the same `StorageEngine` as Scroll's own data
+///   (different namespace prefix). Requires `store.mode = "embedded"`.
+///
+/// Omit the section entirely to run Scroll without Cipher — APPEND /
+/// READ / READ_GROUP / TAIL will fail-closed with
 /// `CapabilityMissing("cipher")`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct CipherConfig {
-    pub addr: String,
+    #[serde(default = "default_cipher_mode")]
+    pub mode: String,
     #[serde(default = "default_keyring")]
     pub keyring: String,
+
+    #[serde(default)]
+    pub addr: Option<String>,
     #[serde(default)]
     pub auth_token: Option<String>,
+
+    #[serde(default = "default_rotation_days")]
+    pub rotation_days: u32,
+    #[serde(default = "default_drain_days")]
+    pub drain_days: u32,
+    #[serde(default = "default_scheduler_interval_secs")]
+    pub scheduler_interval_secs: u64,
+    #[serde(default = "default_cipher_algorithm")]
+    pub algorithm: String,
+}
+
+impl CipherConfig {
+    pub fn is_embedded(&self) -> bool {
+        self.mode == "embedded"
+    }
+
+    pub fn is_remote(&self) -> bool {
+        self.mode == "remote"
+    }
+
+    pub fn validate(&self, store_mode: &str) -> anyhow::Result<()> {
+        match self.mode.as_str() {
+            "remote" => {
+                if self.addr.is_none() {
+                    anyhow::bail!("cipher.mode = \"remote\" requires cipher.addr");
+                }
+            }
+            "embedded" => {
+                if store_mode != "embedded" {
+                    anyhow::bail!(
+                        "cipher.mode = \"embedded\" requires store.mode = \"embedded\" \
+                         (embedded Cipher shares the StorageEngine with Scroll)"
+                    );
+                }
+            }
+            other => anyhow::bail!(
+                "unknown cipher.mode: {other:?} (expected \"remote\" or \"embedded\")"
+            ),
+        }
+        Ok(())
+    }
+}
+
+fn default_cipher_mode() -> String {
+    "remote".into()
 }
 
 fn default_keyring() -> String {
     "scroll-logs".into()
+}
+
+fn default_rotation_days() -> u32 {
+    90
+}
+
+fn default_drain_days() -> u32 {
+    30
+}
+
+fn default_scheduler_interval_secs() -> u64 {
+    3600
+}
+
+fn default_cipher_algorithm() -> String {
+    "aes-256-gcm".into()
 }
 
 pub fn load_config(path: Option<&str>) -> anyhow::Result<ScrollServerConfig> {
@@ -188,7 +267,8 @@ auth_token = "secret"
 "#;
         let cfg: ScrollServerConfig = toml::from_str(toml).unwrap();
         let c = cfg.cipher.unwrap();
-        assert_eq!(c.addr, "127.0.0.1:7175");
+        assert!(c.is_remote());
+        assert_eq!(c.addr.as_deref(), Some("127.0.0.1:7175"));
         assert_eq!(c.keyring, "scroll-prod");
         assert_eq!(c.auth_token.as_deref(), Some("secret"));
     }
@@ -197,5 +277,98 @@ auth_token = "secret"
     fn cipher_section_optional() {
         let cfg: ScrollServerConfig = toml::from_str("").unwrap();
         assert!(cfg.cipher.is_none());
+    }
+
+    #[test]
+    fn parses_embedded_cipher_section() {
+        let toml = r#"
+[cipher]
+mode = "embedded"
+keyring = "scroll-logs"
+rotation_days = 60
+drain_days = 14
+"#;
+        let cfg: ScrollServerConfig = toml::from_str(toml).unwrap();
+        let c = cfg.cipher.unwrap();
+        assert!(c.is_embedded());
+        assert_eq!(c.keyring, "scroll-logs");
+        assert_eq!(c.rotation_days, 60);
+        assert_eq!(c.drain_days, 14);
+        assert_eq!(c.algorithm, "aes-256-gcm");
+    }
+
+    #[test]
+    fn defaults_remote_mode_when_mode_absent() {
+        let toml = r#"
+[cipher]
+addr = "127.0.0.1:7175"
+"#;
+        let cfg: ScrollServerConfig = toml::from_str(toml).unwrap();
+        let c = cfg.cipher.unwrap();
+        assert!(c.is_remote());
+    }
+
+    #[test]
+    fn remote_requires_addr() {
+        let c = CipherConfig {
+            mode: "remote".into(),
+            keyring: "k".into(),
+            addr: None,
+            auth_token: None,
+            rotation_days: 90,
+            drain_days: 30,
+            scheduler_interval_secs: 3600,
+            algorithm: "aes-256-gcm".into(),
+        };
+        let err = c.validate("embedded").unwrap_err();
+        assert!(err.to_string().contains("addr"));
+    }
+
+    #[test]
+    fn embedded_requires_embedded_store() {
+        let c = CipherConfig {
+            mode: "embedded".into(),
+            keyring: "k".into(),
+            addr: None,
+            auth_token: None,
+            rotation_days: 90,
+            drain_days: 30,
+            scheduler_interval_secs: 3600,
+            algorithm: "aes-256-gcm".into(),
+        };
+        let err = c.validate("remote").unwrap_err();
+        assert!(err.to_string().contains("embedded"));
+    }
+
+    #[test]
+    fn embedded_valid_with_embedded_store() {
+        let c = CipherConfig {
+            mode: "embedded".into(),
+            keyring: "k".into(),
+            addr: None,
+            auth_token: None,
+            rotation_days: 90,
+            drain_days: 30,
+            scheduler_interval_secs: 3600,
+            algorithm: "aes-256-gcm".into(),
+        };
+        c.validate("embedded")
+            .expect("embedded + embedded store should validate");
+    }
+
+    #[test]
+    fn unknown_mode_rejected() {
+        let c = CipherConfig {
+            mode: "bogus".into(),
+            keyring: "k".into(),
+            addr: None,
+            auth_token: None,
+            rotation_days: 90,
+            drain_days: 30,
+            scheduler_interval_secs: 3600,
+            algorithm: "aes-256-gcm".into(),
+        };
+        let err = c.validate("embedded").unwrap_err();
+        assert!(err.to_string().contains("bogus"));
     }
 }
