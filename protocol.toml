@@ -5,7 +5,7 @@
 
 [protocol]
 name = "scroll"
-version = "0.1.0"
+version = "0.2.2"
 description = "Durable append-only event log with cursored readers and reader groups"
 default_tcp_port = 7200
 uri_schemes = ["scroll://", "scroll+tls://"]
@@ -32,7 +32,7 @@ description = "Log or reader group does not exist"
 http_equiv = 404
 
 [error_codes.CONFLICT]
-description = "Reader group already exists, or CAS retry budget exhausted"
+description = "Reader group already exists, or CAS retry budget exhausted on group cursor advancement"
 http_equiv = 409
 
 [error_codes.CAPABILITY]
@@ -47,7 +47,7 @@ http_equiv = 500
 
 [commands.APPEND]
 syntax = "APPEND <log> <payload_b64> [HEADERS <json>] [TTL <ms>]"
-description = "Append an entry to a log. Mints a monotonic offset via CAS and encrypts the entry with the per-log DEK."
+description = "Append an entry to a log. Mints a monotonic offset through the per-log serializer and encrypts the entry with the per-log DEK."
 acl = { namespace = "scroll.<log>", scope = "write" }
 parameters = [
     { name = "log", type = "string", required = true, description = "Tenant-scoped log name" },
@@ -81,7 +81,7 @@ response = { status = "string" }
 
 [commands.READ_GROUP]
 syntax = "READ_GROUP <log> <group> <reader_id> <limit>"
-description = "Advance the group cursor under CAS, register PendingEntry records, and return the decrypted batch."
+description = "Advance the group cursor under CAS on `scroll.groups`, register PendingEntry records, and return the decrypted batch."
 acl = { namespace = "scroll.<log>", scope = "read" }
 parameters = [
     { name = "log", type = "string", required = true },
@@ -113,7 +113,7 @@ response = { status = "string" }
 
 [commands.DELETE_GROUP]
 syntax = "DELETE_GROUP <log> <group>"
-description = "Tear down a single reader group: delete every pending record, then remove the group row. Counterpart to CREATE_GROUP; doesn't touch scroll.logs or the DEK, so other groups on the same log keep operating. Returns 'group not found' when the target doesn't exist. Resolves SPEC §17 Q7."
+description = "Tear down a single reader group: delete every pending record, then remove the group row. Counterpart to CREATE_GROUP; doesn't touch scroll.logs or the DEK, so other groups on the same log keep operating. Returns 'group not found' when the target doesn't exist."
 acl = { namespace = "scroll.<log>", scope = "write" }
 parameters = [
     { name = "log", type = "string", required = true },
@@ -123,7 +123,7 @@ response = { status = "string" }
 
 [commands.REPLAY]
 syntax = "REPLAY <log> <group> <offset>"
-description = "Move a DLQ entry back into a group's pending set. Preserves the original reader_id from the DLQ record, resets delivery_count to 1, stamps a fresh delivered_at_ms. Put-pending-first / delete-dlq-second ordering: a crash in-between leaves a duplicate, never a loss. Returns 'dlq entry not found' when the offset has no DLQ record, 'group not found' when the target group doesn't exist. Resolves SPEC §17 Q4."
+description = "Move a DLQ entry back into a group's pending set. Preserves the original reader_id from the DLQ record, resets delivery_count to 1, stamps a fresh delivered_at_ms. Put-pending-first / delete-dlq-second ordering: a crash in-between leaves a duplicate, never a loss. Returns 'dlq entry not found' when the offset has no DLQ record, 'group not found' when the target group doesn't exist."
 acl = { namespace = "scroll.<log>", scope = "write" }
 parameters = [
     { name = "log", type = "string", required = true },
