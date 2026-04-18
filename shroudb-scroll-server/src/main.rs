@@ -106,6 +106,7 @@ async fn run_server<S: Store + 'static>(
         tail_default_timeout_ms: cfg.engine.tail_default_timeout_ms,
         tail_subscribe_buffer: cfg.engine.tail_subscribe_buffer,
         dlq_retention_ttl_ms: cfg.engine.dlq_retention_ttl_ms,
+        min_retention_behind_slowest_group: cfg.engine.min_retention_behind_slowest_group,
     };
     let engine = Arc::new(
         ScrollEngine::new(store, caps, engine_config)

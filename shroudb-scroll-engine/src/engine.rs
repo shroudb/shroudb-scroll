@@ -60,6 +60,18 @@ pub struct EngineConfig {
     /// entries live forever (operators must drain out-of-band). SPEC §11
     /// default: 30 days.
     pub dlq_retention_ttl_ms: Option<i64>,
+    /// Retention guardrail (SPEC §17 Q2): `TRIM` refuses to delete any entry
+    /// whose offset is within `min_retention_behind_slowest_group` of the
+    /// slowest active reader group's cursor.
+    ///
+    /// - `0` (default): Kafka semantics — TRIM trims unconditionally.
+    /// - `N > 0`: TRIM holds entries until the slowest group has advanced
+    ///   past `offset + N`. A paused or lagging group pins retention until
+    ///   it catches up or is explicitly removed via `DELETE_GROUP`.
+    ///
+    /// Applies to explicit `TRIM` only — per-entry TTL set at `APPEND` time
+    /// is enforced by the Store's TTL sweeper and cannot see group state.
+    pub min_retention_behind_slowest_group: u64,
 }
 
 impl Default for EngineConfig {
@@ -81,6 +93,7 @@ impl Default for EngineConfig {
             tail_default_timeout_ms: 30_000,
             tail_subscribe_buffer: 1024,
             dlq_retention_ttl_ms: Some(2_592_000_000), // 30 days
+            min_retention_behind_slowest_group: 0,
         }
     }
 }
@@ -1115,7 +1128,13 @@ impl<S: Store> ScrollEngine<S> {
         if next <= keep {
             return Ok(0);
         }
-        let threshold = next - keep; // delete offsets strictly less than this
+        let mut threshold = next - keep; // delete offsets strictly less than this
+        threshold = self
+            .apply_retention_guardrail(tenant_id, log, threshold)
+            .await?;
+        if threshold == 0 {
+            return Ok(0);
+        }
         let mut deleted: u64 = 0;
         let prefix = Self::entry_prefix(tenant_id, log);
         let mut cursor: Option<String> = None;
@@ -1151,6 +1170,11 @@ impl<S: Store> ScrollEngine<S> {
         age_ms: i64,
     ) -> Result<u64, ScrollError> {
         let cutoff = now_ms().saturating_sub(age_ms);
+        // Guardrail ceiling: highest offset TRIM may delete. `u64::MAX`
+        // leaves the ceiling unbounded (guardrail disabled or no groups).
+        let offset_ceiling = self
+            .apply_retention_guardrail(tenant_id, log, u64::MAX)
+            .await?;
         let mut deleted: u64 = 0;
         let prefix = Self::entry_prefix(tenant_id, log);
         let mut cursor: Option<String> = None;
@@ -1161,6 +1185,10 @@ impl<S: Store> ScrollEngine<S> {
                 .await
                 .map_err(|e| ScrollError::Store(format!("entry list: {e}")))?;
             for key in &page.keys {
+                let offset = offset_from_entry_key(key)?;
+                if offset >= offset_ceiling {
+                    continue; // Guardrail: slowest group hasn't cleared this.
+                }
                 let entry = match self.store.get(LOGS_NS, key, None).await {
                     Ok(e) => e,
                     Err(StoreError::NotFound) => continue,
@@ -1188,6 +1216,76 @@ impl<S: Store> ScrollEngine<S> {
             }
         }
         Ok(deleted)
+    }
+
+    /// Cap a candidate deletion `threshold` by the SPEC §17 Q2 retention
+    /// guardrail: no offset at or above
+    /// `slowest_group_cursor - min_retention_behind_slowest_group` is
+    /// deleted. Returns the effective threshold (≤ input).
+    ///
+    /// - Returns the input unchanged when the guardrail is 0 (default).
+    /// - Returns the input unchanged when the log has no reader groups.
+    /// - Maps the `u64::MAX` "never delivered yet" sentinel to position 0 —
+    ///   a group that has consumed nothing pins the entire log.
+    async fn apply_retention_guardrail(
+        &self,
+        tenant_id: &str,
+        log: &str,
+        threshold: u64,
+    ) -> Result<u64, ScrollError> {
+        let guardrail = self.config.min_retention_behind_slowest_group;
+        if guardrail == 0 {
+            return Ok(threshold);
+        }
+        let slowest = self.slowest_group_cursor(tenant_id, log).await?;
+        let Some(slowest) = slowest else {
+            return Ok(threshold);
+        };
+        let ceiling = slowest.saturating_sub(guardrail);
+        Ok(threshold.min(ceiling))
+    }
+
+    /// Lowest "next offset any group has yet to consume" across all groups
+    /// on the log. `None` when no groups exist. The `u64::MAX` cursor
+    /// sentinel ("nothing delivered yet") maps to 0.
+    async fn slowest_group_cursor(
+        &self,
+        tenant_id: &str,
+        log: &str,
+    ) -> Result<Option<u64>, ScrollError> {
+        let prefix = Self::groups_prefix(tenant_id, log);
+        let mut min_cursor: Option<u64> = None;
+        let mut cursor: Option<String> = None;
+        loop {
+            let page = self
+                .store
+                .list(GROUPS_NS, Some(&prefix), cursor.as_deref(), 256)
+                .await
+                .map_err(|e| ScrollError::Store(format!("group list: {e}")))?;
+            for key in &page.keys {
+                let entry = match self.store.get(GROUPS_NS, key, None).await {
+                    Ok(e) => e,
+                    Err(StoreError::NotFound) => continue,
+                    Err(e) => return Err(ScrollError::Store(format!("group get: {e}"))),
+                };
+                let g: ReaderGroup = serde_json::from_slice(&entry.value)
+                    .map_err(|e| ScrollError::Store(format!("corrupt group: {e}")))?;
+                let next_unconsumed = if g.last_delivered_offset == u64::MAX {
+                    0
+                } else {
+                    g.last_delivered_offset.saturating_add(1)
+                };
+                min_cursor = Some(match min_cursor {
+                    Some(existing) => existing.min(next_unconsumed),
+                    None => next_unconsumed,
+                });
+            }
+            match page.cursor {
+                Some(c) => cursor = Some(c),
+                None => break,
+            }
+        }
+        Ok(min_cursor)
     }
 
     /// DELETE_LOG. Hard teardown: data → groups → pending → offsets → DEK.
@@ -2240,6 +2338,127 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(next, 5);
+    }
+
+    // ── Retention guardrail (SPEC §17 Q2) ───────────────────────────────
+
+    #[tokio::test]
+    async fn trim_respects_slowest_group_guardrail_max_len() {
+        let store = shroudb_storage::test_util::create_test_store("scroll-q2-len").await;
+        let caps = Capabilities::new().with_cipher(FakeCipher::new());
+        let cfg = EngineConfig {
+            min_retention_behind_slowest_group: 3,
+            ..EngineConfig::default()
+        };
+        let eng = ScrollEngine::new(store, caps, cfg).await.unwrap();
+
+        for i in 0..10u8 {
+            eng.append("t", "l", vec![i], BTreeMap::new(), None, &ctx())
+                .await
+                .unwrap();
+        }
+        // Group consumes offsets 0..=3 → next_unconsumed = 4. Guardrail
+        // ceiling = 4 - 3 = 1 → TRIM may only delete offset 0.
+        eng.create_group("t", "l", "g", 0, &ctx()).await.unwrap();
+        let delivered = eng
+            .read_group("t", "l", "g", "r1", 4, &ctx())
+            .await
+            .unwrap();
+        assert_eq!(delivered.len(), 4);
+
+        let deleted = eng.trim("t", "l", TrimBy::MaxLen(2), &ctx()).await.unwrap();
+        assert_eq!(deleted, 1);
+        let remaining = eng.read("t", "l", 0, 100, &ctx()).await.unwrap();
+        let offsets: Vec<u64> = remaining.iter().map(|e| e.offset).collect();
+        assert_eq!(offsets, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    }
+
+    #[tokio::test]
+    async fn trim_guardrail_zero_is_kafka_semantics() {
+        let eng = new_engine().await;
+        for i in 0..10u8 {
+            eng.append("t", "l", vec![i], BTreeMap::new(), None, &ctx())
+                .await
+                .unwrap();
+        }
+        eng.create_group("t", "l", "g", 0, &ctx()).await.unwrap();
+        let deleted = eng.trim("t", "l", TrimBy::MaxLen(2), &ctx()).await.unwrap();
+        assert_eq!(deleted, 8);
+    }
+
+    #[tokio::test]
+    async fn trim_guardrail_pins_to_slowest_of_multiple_groups() {
+        let store = shroudb_storage::test_util::create_test_store("scroll-q2-slowest").await;
+        let caps = Capabilities::new().with_cipher(FakeCipher::new());
+        let cfg = EngineConfig {
+            min_retention_behind_slowest_group: 1,
+            ..EngineConfig::default()
+        };
+        let eng = ScrollEngine::new(store, caps, cfg).await.unwrap();
+
+        for i in 0..10u8 {
+            eng.append("t", "l", vec![i], BTreeMap::new(), None, &ctx())
+                .await
+                .unwrap();
+        }
+        eng.create_group("t", "l", "fast", 0, &ctx()).await.unwrap();
+        eng.create_group("t", "l", "slow", 0, &ctx()).await.unwrap();
+        eng.read_group("t", "l", "fast", "r", 100, &ctx())
+            .await
+            .unwrap();
+        eng.read_group("t", "l", "slow", "r", 2, &ctx())
+            .await
+            .unwrap();
+
+        // Slowest next_unconsumed = slow at 2, guardrail=1 → ceiling = 1.
+        let deleted = eng.trim("t", "l", TrimBy::MaxLen(0), &ctx()).await.unwrap();
+        assert_eq!(deleted, 1);
+        let remaining = eng.read("t", "l", 0, 100, &ctx()).await.unwrap();
+        assert_eq!(remaining.len(), 9);
+        assert_eq!(remaining[0].offset, 1);
+    }
+
+    #[tokio::test]
+    async fn trim_guardrail_no_groups_allows_full_trim() {
+        let store = shroudb_storage::test_util::create_test_store("scroll-q2-nogroup").await;
+        let caps = Capabilities::new().with_cipher(FakeCipher::new());
+        let cfg = EngineConfig {
+            min_retention_behind_slowest_group: 100,
+            ..EngineConfig::default()
+        };
+        let eng = ScrollEngine::new(store, caps, cfg).await.unwrap();
+
+        for i in 0..5u8 {
+            eng.append("t", "l", vec![i], BTreeMap::new(), None, &ctx())
+                .await
+                .unwrap();
+        }
+        let deleted = eng.trim("t", "l", TrimBy::MaxLen(1), &ctx()).await.unwrap();
+        assert_eq!(deleted, 4);
+    }
+
+    #[tokio::test]
+    async fn trim_guardrail_fresh_group_pins_entire_log() {
+        // start_offset=0 → u64::MAX sentinel ("nothing delivered") → maps to
+        // next_unconsumed = 0 → guardrail ceiling = 0 → nothing trimmable.
+        let store = shroudb_storage::test_util::create_test_store("scroll-q2-fresh").await;
+        let caps = Capabilities::new().with_cipher(FakeCipher::new());
+        let cfg = EngineConfig {
+            min_retention_behind_slowest_group: 1,
+            ..EngineConfig::default()
+        };
+        let eng = ScrollEngine::new(store, caps, cfg).await.unwrap();
+
+        for i in 0..5u8 {
+            eng.append("t", "l", vec![i], BTreeMap::new(), None, &ctx())
+                .await
+                .unwrap();
+        }
+        eng.create_group("t", "l", "g", 0, &ctx()).await.unwrap();
+        let deleted = eng.trim("t", "l", TrimBy::MaxLen(1), &ctx()).await.unwrap();
+        assert_eq!(deleted, 0);
+        let remaining = eng.read("t", "l", 0, 100, &ctx()).await.unwrap();
+        assert_eq!(remaining.len(), 5);
     }
 
     // ── Concurrency (SPEC §14) ──────────────────────────────────────────

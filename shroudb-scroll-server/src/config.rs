@@ -88,6 +88,10 @@ pub struct EngineConfig {
     pub tail_subscribe_buffer: usize,
     #[serde(default = "default_dlq_ttl_ms")]
     pub dlq_retention_ttl_ms: Option<i64>,
+    /// SPEC §17 Q2 retention guardrail. `0` = Kafka semantics (default);
+    /// `N > 0` = refuse TRIM within N offsets of slowest group's cursor.
+    #[serde(default)]
+    pub min_retention_behind_slowest_group: u64,
 }
 
 impl Default for EngineConfig {
@@ -103,6 +107,7 @@ impl Default for EngineConfig {
             tail_default_timeout_ms: default_tail_timeout_ms(),
             tail_subscribe_buffer: default_tail_buffer(),
             dlq_retention_ttl_ms: default_dlq_ttl_ms(),
+            min_retention_behind_slowest_group: 0,
         }
     }
 }
